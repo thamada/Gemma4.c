@@ -32,6 +32,9 @@ Gemma4.c/
 ├── doc/
 │   ├── design.md        # 本ドキュメント（設計仕様書）
 │   └── ChangeLog.md     # 変更履歴
+├── tools/               # llama.cpp 比較用ユーティリティ（C++）
+│   ├── llama_dump_gen.cpp    # greedy 生成 token ID ダンプ
+│   └── llama_dump_logits.cpp # logits / hidden ダンプ
 └── gemma4-4b/
     ├── Makefile         # `make model` によるダウンロード・検証
     ├── gguf.txt         # モデル配布 URL（Hugging Face）
@@ -53,7 +56,8 @@ Gemma4.c/
 | `gemma4-4b/cpu-blas/main.c` | 内 | CPU 推論実装 |
 | `gemma4-4b/cpu-blas/Makefile` | 内 | ビルド・実行・依存インストール |
 | `gemma4-4b/cpu-blas/gemma4-cpu-blas` | 外 | ビルド生成物 |
-| `tmp/*` | 外 | 調査・比較用の一時ファイル |
+| `tools/*.cpp` | 内 | llama.cpp 比較用ツール（要 llama.cpp ビルド環境） |
+| `tmp/*` | 外 | 調査・比較用の一時ファイル（llama.cpp クローン等） |
 
 `.gitignore` の該当エントリ:
 
@@ -114,6 +118,7 @@ GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`
 - **Q4_K / Q5_K**: 活性化を Q8_K 化し整数内積（行全体のフル逆量子化を回避）。AVX2 時は SIMD 経路あり
 - **Q6_K / BF16**: OpenMP 並列 GEMV（ブロック逆量子化または F16/BF16 dot）
 - **数値**: `-ffast-math` は使用しない（Q8_K 内積・RMSNorm が崩れるため）
+- **デバッグ**: `-DGEMMA4_USE_GENERIC_DOT` で AVX2 内積を generic 実装に切替可能（SIMD バグ切り分け用）
 
 ### 実行モード
 
@@ -142,8 +147,31 @@ GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`
 | `--thinking-budget <n>` | `--think` 時 **256** | thinking トークン上限。超過時に `<channel|>` を強制挿入（`-1` = 無制限） |
 | `--dump-prompt` | オフ | エンコード後のプロンプト token ID を stderr に出力（デバッグ用） |
 | `--dump-gen` | オフ | 生成 token ID を stderr に出力（デバッグ用） |
+| `--force-gen <ids>` | オフ | カンマ/空白区切り token ID 列を teacher forcing（調査用） |
+| `--dump-logits-at <step>` | オフ | 指定 gen step の top-8 logits を stderr に出力 |
+| `--dump-hidden-at <pos>` | オフ | 指定 pos の各層 hidden state 統計（sum / L2 / max）を stderr に出力 |
 
 Prefill 中は stderr に **progress bar**（`Prefill [====...]`）と、完了後に prefill / decode / total の **スループット要約**を出力する。
+
+### デバッグ・調査用オプションとツール
+
+Thinking 品質調査向けのオプション。通常利用では不要。
+
+| オプション | 用途 |
+|------------|------|
+| `--dump-prompt` / `--dump-gen` | llama.cpp との token 列比較 |
+| `--force-gen <ids>` | llama の生成列を強制入力し teacher forcing で分岐点を特定 |
+| `--dump-logits-at <step>` | 指定 gen step の logits top-8 をダンプ（`tools/llama_dump_logits` と比較） |
+| `--dump-hidden-at <pos>` | 層ごとの hidden state 統計をダンプ（llama eval-callback と比較） |
+
+`tools/` は llama.cpp ビルド環境が必要な比較用 C++ ユーティリティ。
+
+| ツール | 用途 | 例 |
+|--------|------|-----|
+| `llama_dump_gen.cpp` | llama greedy token ID ダンプ | `-m model.gguf -f prompt.txt -n 50` |
+| `llama_dump_logits.cpp` | llama logits / hidden ダンプ | `-m model.gguf --tokens ids.txt --force gen.txt -d 18` |
+
+比較用 llama.cpp は `tmp/llama.cpp/` に配置する想定（Git 管理外）。
 
 ### サンプリング
 
@@ -299,7 +327,7 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 
 ### 既知の制限
 
-- **Thinking モードの品質**: プロンプト token ID 列は llama.cpp と一致する（`--dump-prompt` で検証可能）。`<|channel>` / `<channel|>` の状態遷移と表示分離は動作するが、長い thinking 生成（40 トークン超）で llama.cpp より品質が劣化しやすい。フォワードパス／サンプラーの追加調査が必要。通常モード（`--think` なし）の応答品質は llama.cpp と同等に近い。
+- **Thinking モードの品質**: プロンプト token ID 列は llama.cpp と一致する（`--dump-prompt` で検証可能）。`<|channel>` / `<channel|>` の状態遷移と表示分離は動作する。ただし **Q4_K×Q8_K 量子化 matmul の累積誤差**によりフォワード pass の logits が llama.cpp と乖離し、greedy でも gen step 18 付近で生成軌道が分岐する（通常モードは問題なし）。`--thinking-budget` は `<channel|>` 未到達時の安全装置。根本修正は ggml カーネル利用または LM head 付近の F32 matmul 等が候補（詳細は `ChangeLog.md` 参照）。
 - **Top-k 固定**: `DEFAULT_TOP_K=40` は CLI から変更不可。
 - **共有 KV**: GGUF には全 42 層分の K/V 重みが存在するが、推論は `N_LAYER_KV=24`（層 0–23 が KV を書き込み、24–41 が再利用）で行う。全層独立 KV に変更すると通常モードの出力が破綻するため、llama.cpp の `shared_kv_layers` 設計に従う。
 
