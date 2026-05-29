@@ -4,6 +4,35 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-30 07:22:29 — cpu 参照実装を削除し cpu-blas に一本化
+
+- `gemma4-4b/cpu/` を削除（`main.c`, `Makefile`）。推論実装は `cpu-blas/` のみとする
+- `.gitignore`: `tmp/*` を追加（llama.cpp 比較等の一時ファイル用）
+- `doc/design.md`: 二系統 CPU 実装の記述を削除し、`cpu-blas` 単一構成に更新
+
+## 2026-05-30 07:12:05 — Thinking budget 追加（無限 thinking 対策）
+
+- `gemma4-4b/cpu-blas/main.c`
+  - **`--thinking-budget <n>`** を追加（`--think` 有効時の既定 **256**、`-1` = 無制限）
+  - thinking 区間が上限に達したら `<channel|>` を強制挿入し answer フェーズへ移行
+  - stderr に `[thinking budget N tokens reached; forcing <channel|>]` を表示
+- `doc/design.md`: CLI と Thinking モード説明を更新
+
+## 2026-05-30 06:46:19 — Thinking 品質調査: サンプラー修正と llama.cpp 比較
+
+- `gemma4-4b/cpu-blas/main.c`: llama.cpp 互換のサンプラー修正
+  - repetition penalty 既定値を `1.1` → **`1.0`（無効）** に変更（llama.cpp 既定と一致）
+  - **`penalty_last_n=64`** ウィンドウを追加（`-N <n>`、`0` = 全生成トークン）
+  - greedy 高速経路（`mm_argmax_row`）が logit softcapping をスキップしないよう修正（`logit_softcapping > 0` 時は無効化）
+  - Gemma4 改行トークン: 改行のみの文字列を語彙直接 lookup（llama.cpp PR 21343 相当）
+  - デバッグ用 **`--dump-prompt`** / **`--dump-gen`** を追加
+- `doc/design.md`: CLI 既定値・既知の制限を更新
+- 調査結果
+  - `--think` 時のプロンプト token ID 列は llama.cpp `llama-tokenize` と **完全一致**（20 tokens）
+  - 品質劣化はテンプレート／トークナイズではなく、**長い decode 中の logits 乖離**が原因と推定
+  - greedy でも約 40 トークン以降で llama.cpp と生成軌道が分岐（通常モードは 40 トークン程度で問題なし）
+  - repetition penalty 既定無効化は thinking 長生成への過剰 penalize を除去
+
 ## 2026-05-30 05:34:42 — 設計仕様書の更新（/update-doc）
 
 - `doc/design.md`: 本チャットで実装した機能・修正内容を設計仕様として整理
@@ -16,7 +45,7 @@
 
 ## 2026-05-30 05:31:06 — 対話・Thinking 実装の再調査と llama.cpp 互換性修正
 
-- `gemma4-4b/cpu-blas/main.c` / `gemma4-4b/cpu/main.c`: Gemma 4 チャットテンプレートとトークナイザーの互換性を修正
+- `gemma4-4b/cpu-blas/main.c`: Gemma 4 チャットテンプレートとトークナイザーの互換性を修正
   - Thinking モードの system ターンを GGUF 内 `tokenizer.chat_template` に合わせて修正
     - 修正前: `<|turn>system\n<|think|><turn|>\n`
     - 修正後: `<|turn>system\n<|think|>\n<turn|>\n`
@@ -55,7 +84,6 @@
     - Gemma4 の `f_attention_scale` は `1.0`
     - `shared_kv_layers` に基づく KV 再利用が使われる
   - `gemma4-4b/cpu-blas`: `make build` 成功
-  - `gemma4-4b/cpu`: `make build` 成功
   - `ReadLints`: 関連ファイルに linter エラーなし
   - `cpu-blas` 通常モードで `あなたは何者?` に対して自然な日本語応答を確認
     - 例: `私はGoogle DeepMindによって開発された、オープンウェイトのラージランゲージモデルです。`
@@ -71,7 +99,7 @@
 
 ## 2026-05-30 04:06:35 — 対話モード・Thinking モードの追加
 
-- `gemma4-4b/cpu/main.c` / `cpu-blas/main.c`: マルチターン対話と Thinking モードを追加
+- `gemma4-4b/cpu-blas/main.c`: マルチターン対話と Thinking モードを追加
   - `-i` / `--interactive`: stdin から複数ターンのチャット（`/quit` / `/exit` で終了）
   - `--think`: `<|turn>system\n<|think|>` プレフィックス付きエンコード、`<|channel>thought\n` … `<channel|>` 区間の推論トレース生成
   - `--show-thinking`: 推論トレースを stderr に表示（既定は回答のみ stdout）
@@ -81,30 +109,19 @@
 
 ## 2026-05-30 03:33:13 — ビルド生成物を Git 管理外に設定
 
-- `.gitignore`: `gemma4-4b/cpu/gemma4-cpu` と `gemma4-4b/cpu-blas/gemma4-cpu-blas` を追加
+- `.gitignore`: `gemma4-4b/cpu-blas/gemma4-cpu-blas` を追加
 - `doc/design.md`: Git 管理方針の `.gitignore` 記載を更新
 
 ## 2026-05-30 03:28:28 — gemma4-4b CPU-BLAS 推論実装の追加
 
 - `gemma4-4b/cpu-blas/` ディレクトリを追加
-- `main.c`: `cpu/` と同一デコーダを OpenBLAS + OpenMP で高速化
+- `main.c`: Gemma 4 E4B デコーダを OpenBLAS + OpenMP で実装
   - F32: 行帯並列 + `cblas_sgemv`
   - Q4_K / Q5_K: 活性化 Q8_K + 整数内積（AVX2 時 SIMD）
   - Attention: ヘッド単位 BLAS、OpenBLAS は 1 スレッド固定
 - `cpu-blas/Makefile`: `make build` / `make run` / `make openblas`（`libopenblas-dev` 等）
 - `gemma-4-E4B-it-Q4_K_M.gguf.sha256sum`: Q4_K_M 用チェックサム行を追加（Q8_0 行は維持）
-- `doc/design.md`: 二系統 CPU 実装・cpu-blas ビルド手順を追記
-
-## 2026-05-29 18:00:01 — gemma4-4b CPU 推論実装の追加
-
-- `gemma4-4b/cpu/` ディレクトリを追加
-- `main.c`: `gemma-4-E4B-it-Q4_K_M.gguf` 向け CPU 単スレッド推論エンジン
-  - ISWA（SWA / Full 交互）、共有 KV（層 24–41）、PLE、タイド LM ヘッド、logit softcapping に対応
-  - 量子化: Q4_K / Q5_K / Q6_K / BF16 / F32。ブロック単位逆量子化 GEMV
-  - Gemma 4 BPE トークナイザー、Gemma 4 チャット形式（`<|turn>user` / `<|turn>model`）
-  - Prefill progress bar とスループット要約（stderr）
-- `cpu/Makefile`: `make build` / `make run`（既定 `MODEL=../gemma-4-E4B-it-Q4_K_M.gguf`）
-- `doc/design.md`: CPU 推論・アーキテクチャ・ビルド手順を追記
+- `doc/design.md`: CPU 推論・cpu-blas ビルド手順を追記
 
 ## 2026-05-29 17:20:37 — GGUF モデルを Git 管理外に設定
 
