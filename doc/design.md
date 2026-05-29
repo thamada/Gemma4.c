@@ -12,12 +12,13 @@ Gemma4.c は **Gemma 4 E4B**（主に `gemma-4-E4B-it-Q4_K_M.gguf`）を **C 言
 - **マルチターン対話** (`-i`): stdin から複数ターンのチャット、会話履歴の再エンコード
 - **Thinking モード** (`--think`): Gemma 4 の `<|think|>` / `<|channel>` 形式による推論トレース生成
 
-| 実装 | パス | 依存 | 用途 |
-|------|------|------|------|
-| 参照（単スレッド） | `gemma4-4b/cpu/` | C11 + `libm` のみ | 正しさ・可読性優先のベースライン |
-| 高速（CPU） | `gemma4-4b/cpu-blas/` | OpenBLAS + OpenMP + `libm` | マルチスレッド GEMV・Q8_K 内積による実用速度 |
+| 項目 | 内容 |
+|------|------|
+| 実装 | `gemma4-4b/cpu-blas/` |
+| 依存 | C11、OpenBLAS、OpenMP（`libgomp`）、`libm` |
+| 用途 | マルチスレッド GEMV・Q8_K 内積による CPU 推論 |
 
-両実装は同一デコーダ（ISWA、共有 KV、PLE、タイド LM ヘッド、logit softcapping）・同一 CLI・同一チャット形式を共有する。
+デコーダは ISWA、共有 KV、PLE、タイド LM ヘッド、logit softcapping を実装する。単発推論・対話・Thinking モードを同一 CLI で提供する。
 
 大容量の GGUF モデルファイルは Git 管理外とし、リポジトリには取得手順・整合性検証用チェックサム・上記 CPU 推論実装を含めます。
 
@@ -27,6 +28,7 @@ Gemma4.c は **Gemma 4 E4B**（主に `gemma-4-E4B-it-Q4_K_M.gguf`）を **C 言
 Gemma4.c/
 ├── LICENSE              # Apache License 2.0
 ├── .gitignore           # Git 管理外ファイルの定義
+├── tmp/                 # 調査・比較用一時ファイル（Git 管理外）
 ├── doc/
 │   ├── design.md        # 本ドキュメント（設計仕様書）
 │   └── ChangeLog.md     # 変更履歴
@@ -35,9 +37,6 @@ Gemma4.c/
     ├── gguf.txt         # モデル配布 URL（Hugging Face）
     ├── gemma-4-E4B-it-Q4_K_M.gguf.sha256sum  # SHA256 チェックサム（Git 管理）
     ├── gemma-4-E4B-it-Q4_K_M.gguf            # モデル本体（Git 管理外）
-    ├── cpu/
-    │   ├── main.c       # CPU 単スレッド推論エンジン
-    │   └── Makefile     # `make build` / `make run`
     └── cpu-blas/
         ├── main.c       # OpenBLAS + OpenMP 推論エンジン
         └── Makefile     # `make build` / `make run` / `make openblas`
@@ -51,19 +50,17 @@ Gemma4.c/
 | `gemma4-4b/gemma-4-E4B-it-Q4_K_M.gguf.sha256sum` | 内 | ダウンロード後の整合性検証に使用 |
 | `gemma4-4b/gguf.txt` | 内 | ダウンロード元 URL |
 | `gemma4-4b/Makefile` | 内 | モデル取得ターゲット |
-| `gemma4-4b/cpu/main.c` | 内 | CPU 参照推論実装 |
-| `gemma4-4b/cpu/Makefile` | 内 | ビルド・実行 |
-| `gemma4-4b/cpu/gemma4-cpu` | 外 | ビルド生成物 |
-| `gemma4-4b/cpu-blas/main.c` | 内 | OpenBLAS 推論実装 |
+| `gemma4-4b/cpu-blas/main.c` | 内 | CPU 推論実装 |
 | `gemma4-4b/cpu-blas/Makefile` | 内 | ビルド・実行・依存インストール |
 | `gemma4-4b/cpu-blas/gemma4-cpu-blas` | 外 | ビルド生成物 |
+| `tmp/*` | 外 | 調査・比較用の一時ファイル |
 
 `.gitignore` の該当エントリ:
 
 ```
 gemma4-4b/gemma-4-E4B-it-Q4_K_M.gguf
-gemma4-4b/cpu/gemma4-cpu
 gemma4-4b/cpu-blas/gemma4-cpu-blas
+tmp/*
 ```
 
 ## モデル取得（gemma4-4b）
@@ -96,19 +93,27 @@ make model
 |------|------------|------|
 | `MODEL` | `gemma-4-E4B-it-Q4_K_M.gguf` | 取得・検証対象のモデルファイル名 |
 
-## CPU 推論（参照版: gemma4-4b/cpu）
+## CPU 推論（gemma4-4b/cpu-blas）
 
 ### 実装概要
 
 | 項目 | 内容 |
 |------|------|
-| ソース | `gemma4-4b/cpu/main.c` |
-| ビルド | `make build` → 実行ファイル `gemma4-cpu` |
-| 実行 | `make run` または `./gemma4-cpu <model.gguf> [options]` |
-| 依存 | C11 コンパイラ、`libm` のみ |
-| スレッド | 単スレッド（参照実装・正しさ優先） |
+| ソース | `gemma4-4b/cpu-blas/main.c` |
+| ビルド | `make build` → 実行ファイル `gemma4-cpu-blas` |
+| 実行 | `make run` または `./gemma4-cpu-blas <model.gguf> [options]` |
+| 依存 | C11、`libopenblas`、`libgomp`（OpenMP） |
+| 並列 | OpenMP（`OMP_NUM_THREADS`）。OpenBLAS は `openblas_set_num_threads(1)` で単スレッド固定し、二重並列を避ける |
 
-GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`QK_K=256` ブロック単位**でスタック上に逆量子化しながら GEMV する。全重みの float 一括展開は行わない。
+GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`QK_K=256` ブロック単位**で逆量子化しながら GEMV する。全重みの float 一括展開は行わない。起動時に OpenMP 最大スレッド数を表示する。
+
+### 最適化の要点
+
+- **F32 行列**: 行帯を OpenMP で分割し、帯ごとに `cblas_sgemv`（NoTrans）
+- **Attention**: ヘッド単位で K 内積・V 合成を `cblas_sgemv` に集約（SWA 窓・共有 KV 対応）
+- **Q4_K / Q5_K**: 活性化を Q8_K 化し整数内積（行全体のフル逆量子化を回避）。AVX2 時は SIMD 経路あり
+- **Q6_K / BF16**: OpenMP 並列 GEMV（ブロック逆量子化または F16/BF16 dot）
+- **数値**: `-ffast-math` は使用しない（Q8_K 内積・RMSNorm が崩れるため）
 
 ### 実行モード
 
@@ -127,14 +132,16 @@ GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`
 | `-n <tokens>` | `256` | ターンあたりの最大生成トークン数（内部上限 `MAX_GEN_TOKS=4096`） |
 | `-t <temp>` | `0.6` | サンプリング温度（`0` で greedy） |
 | `-k <topp>` | `0.9` | Top-p サンプリング |
-| `-r <penalty>` | `1.1` | Repetition penalty（`-r 1.0` で無効化） |
+| `-r <penalty>` | `1.0` | Repetition penalty（llama.cpp 互換。`-r 1.1` 等で有効化） |
+| `-N <n>` | `64` | Repetition penalty の対象ウィンドウ（`0` = 全生成トークン） |
 | `-s <seed>` | 時刻 | 乱数シード |
 | `-l <len>` | `8192` | 最大シーケンス長（KV キャッシュ上限） |
 | `-i` / `--interactive` | オフ | 対話型マルチターン モード |
 | `--think` | オフ | Thinking モード（推論トレースを生成。既定では回答のみ表示） |
 | `--show-thinking` | オフ | Thinking トレースを stderr に表示（`--think` を暗黙的に有効化） |
-
-`cpu-blas` も上記と同一の CLI オプションを受け付ける。
+| `--thinking-budget <n>` | `--think` 時 **256** | thinking トークン上限。超過時に `<channel|>` を強制挿入（`-1` = 無制限） |
+| `--dump-prompt` | オフ | エンコード後のプロンプト token ID を stderr に出力（デバッグ用） |
+| `--dump-gen` | オフ | 生成 token ID を stderr に出力（デバッグ用） |
 
 Prefill 中は stderr に **progress bar**（`Prefill [====...]`）と、完了後に prefill / decode / total の **スループット要約**を出力する。
 
@@ -142,7 +149,7 @@ Prefill 中は stderr に **progress bar**（`Prefill [====...]`）と、完了�
 
 llama.cpp の Gemma 4 既定に近い順序でサンプリングする。
 
-1. **Repetition penalty**（`-r`、既定 `1.1`）: 生成済みトークンの logit に符号に応じた penalty を適用
+1. **Repetition penalty**（`-r`、既定 `1.0` 無効）: 直近 `-N`（既定 64）トークンの logit に penalty を適用
 2. **Top-k**（固定 `40`、`DEFAULT_TOP_K`）: logit 上位 k 件に候補を絞る
 3. **Temperature**（`-t`）: softmax 前に logit をスケール（`0` で argmax）
 4. **Top-p**（`-k`）: 累積確率で nucleus サンプリング
@@ -155,76 +162,37 @@ Top-k は CLI から変更できない。反復ループが目立つ場合は `-
 cd gemma4-4b
 make model          # 初回のみ GGUF 取得
 
-cd cpu
+cd cpu-blas
+make openblas       # 初回: libopenblas-dev, libgomp1（apt、要 sudo の場合あり）
 make build
 make run            # 既定 MODEL=../gemma-4-E4B-it-Q4_K_M.gguf
 
-# 例: プロンプトと生成長を指定
-./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 64
-
-# 例: 対話モード
-./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -i
-
-# 例: Thinking モード（回答のみ表示）
-./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "Explain recursion" --think
-
-# 例: Thinking トレースも表示
-./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -i --show-thinking
-
-# 例: 日本語プロンプト（add_space_prefix により先頭空白が自動付与）
-./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "あなたは何者?" -n 128
-
-# 例: repetition penalty を無効化
-./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -r 1.0
-```
-
-### Makefile 変数（cpu）
-
-| 変数 | デフォルト | 説明 |
-|------|------------|------|
-| `MODEL` | `../gemma-4-E4B-it-Q4_K_M.gguf` | 推論対象 GGUF（`cpu/` からの相対パス） |
-| `PROMPT` | `Hello, how are you?` | `make run` 時のプロンプト |
-| `CC` | `cc` | C コンパイラ |
-| `CFLAGS` | `-O3 -std=c11 -Wall -Wextra ...` | コンパイルフラグ |
-
-## CPU 推論（高速版: gemma4-4b/cpu-blas）
-
-### 実装概要
-
-| 項目 | 内容 |
-|------|------|
-| ソース | `gemma4-4b/cpu-blas/main.c` |
-| ビルド | `make build` → 実行ファイル `gemma4-cpu-blas` |
-| 実行 | `make run` または `./gemma4-cpu-blas <model.gguf> [options]` |
-| 依存 | C11、`libopenblas`、`libgomp`（OpenMP） |
-| 並列 | OpenMP（`OMP_NUM_THREADS`）。OpenBLAS は `openblas_set_num_threads(1)` で単スレッド固定し、二重並列を避ける |
-
-`cpu/` と同一の GGUF・CLI オプション・実行モード（単発 / 対話 / Thinking）・チャット形式。起動時に OpenMP 最大スレッド数を表示する。
-
-### 最適化の要点
-
-- **F32 行列**: 行帯を OpenMP で分割し、帯ごとに `cblas_sgemv`（NoTrans）
-- **Attention**: ヘッド単位で K 内積・V 合成を `cblas_sgemv` に集約（SWA 窓・共有 KV 対応）
-- **Q4_K / Q5_K**: 活性化を Q8_K 化し整数内積（行全体のフル逆量子化を回避）。AVX2 時は SIMD 経路あり
-- **Q6_K / BF16**: OpenMP 並列 GEMV（ブロック逆量子化または F16/BF16 dot）
-- **数値**: `-ffast-math` は使用しない（Q8_K 内積・RMSNorm が崩れるため）
-
-### ビルド・依存の取得
-
-```bash
-cd gemma4-4b/cpu-blas
-make openblas    # 初回: libopenblas-dev, libgomp1（apt、要 sudo の場合あり）
-make build
-make run
-
 # ヘッダが非標準パスにある場合（Debian/Ubuntu pthread ビルド例）
 make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
+
+# 例: プロンプトと生成長を指定
+./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 64
+
+# 例: 対話モード
+./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -i
+
+# 例: Thinking モード（回答のみ表示）
+./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Explain recursion" --think
+
+# 例: Thinking トレースも表示
+./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -i --show-thinking
+
+# 例: 日本語プロンプト（add_space_prefix により先頭空白が自動付与）
+./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "あなたは何者?" -n 128
+
+# 例: repetition penalty を有効化
+./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -r 1.1
 
 # スレッド数の例
 OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 64
 ```
 
-### Makefile 変数（cpu-blas）
+### Makefile 変数
 
 | 変数 | デフォルト | 説明 |
 |------|------------|------|
@@ -318,7 +286,7 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 <|turn>model\n
 ```
 
-生成時、モデルは `<|channel>thought\n` … `<channel|>` で囲まれた推論トレースの後に回答を出力する。GGUF 語彙では `<|channel>thought\n` が `<|channel>` + 通常トークン列に分かれる場合があるため、実装は `<|channel>` / `<channel|>` を境界として扱う。
+生成時、モデルは `<|channel>thought\n` … `<channel|>` で囲まれた推論トレースの後に回答を出力する。実装品質の問題で `<channel|>` が自然に出ない場合があるため、`--thinking-budget`（既定 256）で上限超過時に `<channel|>` を強制し answer フェーズへ移行する。
 
 サンプリングの詳細は「サンプリング」節を参照。
 
@@ -331,7 +299,7 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 
 ### 既知の制限
 
-- **Thinking モードの品質**: `<|channel>` / `<channel|>` の状態遷移と表示分離は動作するが、同一 GGUF を llama.cpp で実行した場合と比べ、推論トレースの内容品質が劣ることがある。通常モード（`--think` なし）の応答品質は llama.cpp と同等に近い。
+- **Thinking モードの品質**: プロンプト token ID 列は llama.cpp と一致する（`--dump-prompt` で検証可能）。`<|channel>` / `<channel|>` の状態遷移と表示分離は動作するが、長い thinking 生成（40 トークン超）で llama.cpp より品質が劣化しやすい。フォワードパス／サンプラーの追加調査が必要。通常モード（`--think` なし）の応答品質は llama.cpp と同等に近い。
 - **Top-k 固定**: `DEFAULT_TOP_K=40` は CLI から変更不可。
 - **共有 KV**: GGUF には全 42 層分の K/V 重みが存在するが、推論は `N_LAYER_KV=24`（層 0–23 が KV を書き込み、24–41 が再利用）で行う。全層独立 KV に変更すると通常モードの出力が破綻するため、llama.cpp の `shared_kv_layers` 設計に従う。
 

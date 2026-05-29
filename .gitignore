@@ -4,3 +4,4 @@ gemma4-4b/gemma-4-E4B-it-Q4_K_M.gguf
 # CPU inference build artifacts
 gemma4-4b/cpu/gemma4-cpu
 gemma4-4b/cpu-blas/gemma4-cpu-blas
+tmp/*
