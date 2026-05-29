@@ -68,7 +68,9 @@ static inline __m256i get_scale_shuffle_k4(int i) {
 #define MAX_GEN_TOKS    4096
 #define MAX_CHAT_TURNS  128
 #define MAX_LINE        4096
-#define DEFAULT_TOP_K   40
+#define DEFAULT_TOP_K          40
+#define DEFAULT_PENALTY_LAST_N 64
+#define DEFAULT_THINKING_BUDGET 256
 #define MAX_Q_DIM       4096   /* 8 heads * 512 */
 #define MAX_KV_DIM      1024   /* 2 kv_heads * 512 */
 #define MAX_PLE_DIM     256
@@ -1137,8 +1139,22 @@ static void append_str_tok(Tok *tk, int *out, int *n, const char *s) {
         out[(*n)++] = id;
         return;
     }
+    int slen = (int)strlen(s);
+    if (slen > 0) {
+        int all_nl = 1;
+        for (int i = 0; i < slen; i++) {
+            if (s[i] != '\n') { all_nl = 0; break; }
+        }
+        if (all_nl) {
+            id = tok_lookup(tk, s, slen);
+            if (id >= 0) {
+                out[(*n)++] = id;
+                return;
+            }
+        }
+    }
     int nt;
-    int *t = gemma_bpe_encode(tk, s, (int)strlen(s), &nt);
+    int *t = gemma_bpe_encode(tk, s, slen, &nt);
     append_tokens(out, n, t, nt);
     free(t);
 }
@@ -2003,9 +2019,13 @@ static int sample_token(float *logits, int n, float temp, float topp, int topk, 
     return result;
 }
 
-static void apply_repetition_penalty(float *logits, const int *tokens, int n_tokens, float penalty) {
+static void apply_repetition_penalty(float *logits, const int *tokens, int n_tokens,
+                                     float penalty, int penalty_last_n) {
     if (penalty <= 1.0f || !tokens || n_tokens <= 0) return;
-    for (int i = 0; i < n_tokens; i++) {
+    int start = 0;
+    if (penalty_last_n > 0 && n_tokens > penalty_last_n)
+        start = n_tokens - penalty_last_n;
+    for (int i = start; i < n_tokens; i++) {
         int id = tokens[i];
         if (id < 0) continue;
         if (logits[id] >= 0.0f) logits[id] /= penalty;
@@ -2183,7 +2203,9 @@ static void throughput_summary(int n_prefill, double prefill_sec,
 
 static int generate(Model *m, int *prompt, int n_prompt,
                      int max_new, float temp, float topp, uint64_t seed,
-                     float repeat_penalty, int enable_thinking, int show_thinking, TokenBuf *gen_out) {
+                     float repeat_penalty, int penalty_last_n,
+                     int enable_thinking, int show_thinking, int thinking_budget,
+                     TokenBuf *gen_out) {
     uint64_t rng = seed ? seed : 1;
     int token = prompt[0];
     int gen = 0;
@@ -2191,11 +2213,13 @@ static int generate(Model *m, int *prompt, int n_prompt,
     int decode_timing = 0;
     double prefill_sec = 0.0;
     int greedy = (temp <= 0.0f);
-    int fast_argmax = greedy && repeat_penalty <= 1.0f;
+    int fast_argmax = greedy && repeat_penalty <= 1.0f && m->cfg.logit_softcapping <= 0.0f;
     PrintMode pmode = enable_thinking ? OUT_HIDDEN : OUT_ANSWER;
     int saw_thought = 0;
     int saw_answer = 0;
     int skipping_channel_label = 0;
+    int thinking_tokens = 0;
+    int thinking_budget_warned = 0;
 
     if (gen_out) {
         gen_out->n = 0;
@@ -2247,8 +2271,20 @@ static int generate(Model *m, int *prompt, int n_prompt,
                 decode_timing = 1;
             }
             if (gen_out && repeat_penalty > 1.0f)
-                apply_repetition_penalty(m->s.logits, gen_out->tokens, gen_out->n, repeat_penalty);
-            if (fast_argmax) {
+                apply_repetition_penalty(m->s.logits, gen_out->tokens, gen_out->n,
+                                         repeat_penalty, penalty_last_n);
+            int force_channel_end = enable_thinking && saw_thought && !saw_answer &&
+                thinking_budget >= 0 && thinking_tokens >= thinking_budget &&
+                m->tok.channel_end >= 0;
+            if (force_channel_end) {
+                if (!thinking_budget_warned) {
+                    fprintf(stderr,
+                            "\n[thinking budget %d tokens reached; forcing <channel|>]\n",
+                            thinking_budget);
+                    thinking_budget_warned = 1;
+                }
+                next = m->tok.channel_end;
+            } else if (fast_argmax) {
                 next = m->s.argmax_tok;
             } else if (greedy) {
                 next = sample_token(m->s.logits, m->cfg.vocab_size, 0.0f, topp, DEFAULT_TOP_K, &rng);
@@ -2281,6 +2317,8 @@ static int generate(Model *m, int *prompt, int n_prompt,
                         skipping_channel_label = 0;
                         pmode = show_thinking ? OUT_THINKING : OUT_HIDDEN;
                     }
+                } else if (saw_thought && !saw_answer) {
+                    thinking_tokens++;
                 }
             }
 
@@ -2327,7 +2365,8 @@ static char *read_user_line(const char *label) {
 }
 
 static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int show_thinking,
-                         int max_new, float temp, float topp, float repeat_penalty, uint64_t seed) {
+                         int max_new, float temp, float topp, float repeat_penalty,
+                         int penalty_last_n, int thinking_budget, uint64_t seed) {
     int *prompt = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
     int n_prompt = chat_encode_history(&m->tok, hist, enable_thinking, prompt, MAX_PROMPT_TOKS);
     if (n_prompt < 0) {
@@ -2342,7 +2381,8 @@ static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int s
     TokenBuf gen;
     tokenbuf_init(&gen);
     generate(m, prompt, n_prompt, max_new, temp, topp, seed,
-             repeat_penalty, enable_thinking, show_thinking, &gen);
+             repeat_penalty, penalty_last_n, enable_thinking, show_thinking,
+             thinking_budget, &gen);
     free(prompt);
 
     char *thinking = NULL, *answer = NULL;
@@ -2368,30 +2408,48 @@ static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int s
 }
 
 static void run_single_shot(Model *m, const char *prompt, int enable_thinking, int show_thinking,
-                            int max_new, float temp, float topp, float repeat_penalty, uint64_t seed) {
+                            int max_new, float temp, float topp, float repeat_penalty,
+                            int penalty_last_n, int thinking_budget,
+                            int dump_prompt, int dump_gen, uint64_t seed) {
     int n_prompt_tokens;
     int *prompt_tokens = chat_encode(&m->tok, prompt, enable_thinking, &n_prompt_tokens);
     printf("Prompt: \"%s\" (%d tokens)%s\n\n", prompt, n_prompt_tokens,
            enable_thinking ? " [thinking]" : "");
+    if (dump_prompt) {
+        fprintf(stderr, "Prompt token IDs:");
+        for (int i = 0; i < n_prompt_tokens; i++)
+            fprintf(stderr, " %d", prompt_tokens[i]);
+        fputc('\n', stderr);
+    }
 
     TokenBuf gen;
     tokenbuf_init(&gen);
     generate(m, prompt_tokens, n_prompt_tokens, max_new, temp, topp, seed,
-             repeat_penalty, enable_thinking, show_thinking, &gen);
+             repeat_penalty, penalty_last_n, enable_thinking, show_thinking,
+             thinking_budget, &gen);
+    if (dump_gen) {
+        fprintf(stderr, "Generated token IDs:");
+        for (int i = 0; i < gen.n; i++)
+            fprintf(stderr, " %d", gen.tokens[i]);
+        fputc('\n', stderr);
+    }
     free(prompt_tokens);
     tokenbuf_free(&gen);
 }
 
 static void run_interactive(Model *m, const char *initial_prompt, int enable_thinking,
                             int show_thinking, int max_new, float temp, float topp,
-                            float repeat_penalty, uint64_t seed) {
+                            float repeat_penalty, int penalty_last_n, int thinking_budget,
+                            uint64_t seed) {
     ChatHistory hist;
     chat_history_init(&hist);
 
     fprintf(stderr, "Interactive mode ( /quit to exit )\n");
     if (enable_thinking) {
-        fprintf(stderr, "Thinking mode: ON%s\n",
-                show_thinking ? " (showing trace)" : " (answer only)");
+        fprintf(stderr, "Thinking mode: ON%s", show_thinking ? " (showing trace)" : " (answer only)");
+        if (thinking_budget >= 0)
+            fprintf(stderr, " [budget=%d tokens]", thinking_budget);
+        fputc('\n', stderr);
     }
 
     char *line = NULL;
@@ -2410,7 +2468,8 @@ static void run_interactive(Model *m, const char *initial_prompt, int enable_thi
         line = NULL;
 
         if (run_chat_turn(m, &hist, enable_thinking, show_thinking,
-                          max_new, temp, topp, repeat_penalty, seed) < 0)
+                          max_new, temp, topp, repeat_penalty, penalty_last_n,
+                          thinking_budget, seed) < 0)
             break;
     }
 
@@ -2430,12 +2489,18 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  -n <tokens>       Max tokens to generate per turn (default: 256)\n");
         fprintf(stderr, "  -t <temp>         Temperature (default: 0.6)\n");
         fprintf(stderr, "  -k <topp>         Top-p sampling (default: 0.9)\n");
-        fprintf(stderr, "  -r <penalty>      Repetition penalty (default: 1.1, disable: 1.0)\n");
+        fprintf(stderr, "  -r <penalty>      Repetition penalty (default: 1.0, llama.cpp compat)\n");
+        fprintf(stderr, "  -N <n>            Repetition penalty window (default: 64, 0 = all tokens)\n");
         fprintf(stderr, "  -s <seed>         Random seed (default: time)\n");
         fprintf(stderr, "  -l <len>          Max sequence length (default: 8192)\n");
         fprintf(stderr, "  -i                Interactive multi-turn mode\n");
         fprintf(stderr, "  --think           Enable thinking mode\n");
         fprintf(stderr, "  --show-thinking   Show reasoning trace (requires --think)\n");
+        fprintf(stderr, "  --thinking-budget <n>  Max thinking tokens before forcing <channel|>\n");
+        fprintf(stderr, "                       (default: %d with --think, -1 = unlimited)\n",
+                DEFAULT_THINKING_BUDGET);
+        fprintf(stderr, "  --dump-prompt     Print prompt token IDs to stderr\n");
+        fprintf(stderr, "  --dump-gen        Print generated token IDs to stderr\n");
         return 1;
     }
 
@@ -2444,12 +2509,17 @@ int main(int argc, char *argv[]) {
     int   max_tokens = 256;
     float temp       = 0.6f;
     float topp       = 0.9f;
-    float repeat_penalty = 1.1f;
+    float repeat_penalty = 1.0f;
+    int   penalty_last_n = DEFAULT_PENALTY_LAST_N;
     uint64_t seed    = (uint64_t)time(NULL);
     int   max_seq    = 8192;
     int   interactive = 0;
     int   enable_thinking = 0;
     int   show_thinking = 0;
+    int   dump_prompt = 0;
+    int   dump_gen = 0;
+    int   thinking_budget = -1;
+    int   thinking_budget_user = 0;
 
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) {
@@ -2465,6 +2535,24 @@ int main(int argc, char *argv[]) {
             show_thinking = 1;
             continue;
         }
+        if (!strcmp(argv[i], "--dump-prompt")) {
+            dump_prompt = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--dump-gen")) {
+            dump_gen = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--thinking-budget")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: option %s requires a value\n", argv[i]);
+                return 1;
+            }
+            thinking_budget = atoi(argv[i + 1]);
+            thinking_budget_user = 1;
+            i++;
+            continue;
+        }
         if (i + 1 >= argc) {
             fprintf(stderr, "Error: option %s requires a value\n", argv[i]);
             return 1;
@@ -2476,6 +2564,9 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "-r")) {
             repeat_penalty = (float)atof(argv[i + 1]);
         }
+        else if (!strcmp(argv[i], "-N")) {
+            penalty_last_n = atoi(argv[i + 1]);
+        }
         else if (!strcmp(argv[i], "-s")) seed       = (uint64_t)strtoull(argv[i + 1], NULL, 10);
         else if (!strcmp(argv[i], "-l")) max_seq    = atoi(argv[i + 1]);
         else {
@@ -2484,6 +2575,9 @@ int main(int argc, char *argv[]) {
         }
         i++;
     }
+
+    if (enable_thinking && !thinking_budget_user)
+        thinking_budget = DEFAULT_THINKING_BUDGET;
 
     printf("Loading %s ...\n", model_path);
 
@@ -2523,10 +2617,12 @@ int main(int argc, char *argv[]) {
 
     if (interactive) {
         run_interactive(&model, prompt, enable_thinking, show_thinking,
-                        max_tokens, temp, topp, repeat_penalty, seed);
+                        max_tokens, temp, topp, repeat_penalty, penalty_last_n,
+                        thinking_budget, seed);
     } else {
         run_single_shot(&model, prompt, enable_thinking, show_thinking,
-                        max_tokens, temp, topp, repeat_penalty, seed);
+                        max_tokens, temp, topp, repeat_penalty, penalty_last_n,
+                        thinking_budget, dump_prompt, dump_gen, seed);
     }
     free_state(&model.s);
     free_weight_ptrs(&model.w, c->n_layers);
