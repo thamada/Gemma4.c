@@ -29,6 +29,7 @@
 #define MAX_GEN_TOKS    4096
 #define MAX_CHAT_TURNS  128
 #define MAX_LINE        4096
+#define DEFAULT_TOP_K   40
 #define MAX_Q_DIM       4096   /* 8 heads * 512 */
 #define MAX_KV_DIM      1024   /* 2 kv_heads * 512 */
 #define MAX_PLE_DIM     256
@@ -213,6 +214,7 @@ typedef struct {
     int *vlen;
     float *scores;
     int size, bos, eos, eot;
+    int add_space_prefix;
     int turn_start, turn_end, turn_user, turn_model, turn_system;
     int think, channel, channel_thought, channel_end;
     int *htab;
@@ -437,6 +439,7 @@ static void parse_gguf(Model *m, char ***out_merges, int *out_n_merges) {
     tk->bos = 2;
     tk->eos = 106;
     tk->eot = 106;
+    tk->add_space_prefix = 1;
 
     *out_merges = NULL;
     *out_n_merges = 0;
@@ -482,6 +485,7 @@ static void parse_gguf(Model *m, char ***out_merges, int *out_n_merges) {
         }
         else if (!strcmp(key, "gemma4.context_length"))                       c->max_seq = (int)read_int_val(&r, vt);
         else if (!strcmp(key, "tokenizer.ggml.bos_token_id"))                 tk->bos = (int)read_int_val(&r, vt);
+        else if (!strcmp(key, "tokenizer.ggml.add_space_prefix"))             tk->add_space_prefix = (int)read_int_val(&r, vt);
         else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) {
             tk->eos = (int)read_int_val(&r, vt);
             tk->eot = tk->eos;
@@ -621,10 +625,14 @@ static int utf8_char_len(unsigned char c) {
     return 1;
 }
 
-static char *gemma_escape_line(const char *line, int line_len, int *out_len) {
-    int cap = line_len * 4 + 1;
+static char *gemma_escape_line(const char *line, int line_len, int add_prefix, int *out_len) {
+    int cap = line_len * 4 + 4;
     char *buf = (char *)malloc((size_t)cap);
     int o = 0;
+    if (add_prefix && line_len > 0) {
+        memcpy(buf + o, GEMMA4_SP, 3);
+        o += 3;
+    }
     for (int i = 0; i < line_len; ) {
         unsigned char c = (unsigned char)line[i];
         if (c == ' ') {
@@ -716,7 +724,7 @@ static void append_gemma_text(Tok *tk, int *out, int *n, const char *text) {
             int line_len = (int)(p - line);
             if (line_len > 0) {
                 int elen;
-                char *escaped = gemma_escape_line(line, line_len, &elen);
+                char *escaped = gemma_escape_line(line, line_len, tk->add_space_prefix, &elen);
                 int nt;
                 int *t = gemma_bpe_encode(tk, escaped, elen, &nt);
                 append_tokens(out, n, t, nt);
@@ -733,7 +741,7 @@ static void append_gemma_text(Tok *tk, int *out, int *n, const char *text) {
     if (p > line) {
         int line_len = (int)(p - line);
         int elen;
-        char *escaped = gemma_escape_line(line, line_len, &elen);
+        char *escaped = gemma_escape_line(line, line_len, tk->add_space_prefix, &elen);
         int nt;
         int *t = gemma_bpe_encode(tk, escaped, elen, &nt);
         append_tokens(out, n, t, nt);
@@ -751,45 +759,44 @@ static void append_turn_end(Tok *tk, int *out, int *n) {
     }
 }
 
-static void append_user_turn(Tok *tk, int *out, int *n, const char *text) {
-    if (tk->turn_user >= 0) {
-        out[(*n)++] = tk->turn_user;
+static void append_turn_role(Tok *tk, int *out, int *n, int combined_id, const char *role) {
+    if (combined_id >= 0) {
+        out[(*n)++] = combined_id;
+    } else if (tk->turn_start >= 0) {
+        out[(*n)++] = tk->turn_start;
+        append_str_tok(tk, out, n, role);
+        append_str_tok(tk, out, n, "\n");
     } else {
-        append_str_tok(tk, out, n, "<|turn>user\n");
+        append_str_tok(tk, out, n, "<|turn>");
+        append_str_tok(tk, out, n, role);
+        append_str_tok(tk, out, n, "\n");
     }
+}
+
+static void append_user_turn(Tok *tk, int *out, int *n, const char *text) {
+    append_turn_role(tk, out, n, tk->turn_user, "user");
     append_gemma_text(tk, out, n, text);
     append_turn_end(tk, out, n);
 }
 
 static void append_model_turn(Tok *tk, int *out, int *n, const char *text) {
-    if (tk->turn_model >= 0) {
-        out[(*n)++] = tk->turn_model;
-    } else {
-        append_str_tok(tk, out, n, "<|turn>model\n");
-    }
+    append_turn_role(tk, out, n, tk->turn_model, "model");
     append_gemma_text(tk, out, n, text);
     append_turn_end(tk, out, n);
 }
 
 static void append_model_prefix(Tok *tk, int *out, int *n) {
-    if (tk->turn_model >= 0) {
-        out[(*n)++] = tk->turn_model;
-    } else {
-        append_str_tok(tk, out, n, "<|turn>model\n");
-    }
+    append_turn_role(tk, out, n, tk->turn_model, "model");
 }
 
 static void append_system_think_turn(Tok *tk, int *out, int *n) {
-    if (tk->turn_system >= 0) {
-        out[(*n)++] = tk->turn_system;
-    } else {
-        append_str_tok(tk, out, n, "<|turn>system\n");
-    }
+    append_turn_role(tk, out, n, tk->turn_system, "system");
     if (tk->think >= 0) {
         out[(*n)++] = tk->think;
     } else {
         append_str_tok(tk, out, n, "<|think|>");
     }
+    append_str_tok(tk, out, n, "\n");
     append_turn_end(tk, out, n);
 }
 
@@ -1230,7 +1237,7 @@ static void forward(Model *m, int token, int pos) {
         int swa = is_swa_layer(c, l);
         float rope_base = swa ? c->rope_theta_swa : c->rope_theta;
         const float *freq_factors = swa ? NULL : w->rope_freqs;
-        float attn_scale = 1.0f; /* Gemma4 f_attention_scale = 1.0 in llama.cpp */
+        float attn_scale = 1.0f;
 
         float x_before[4096];
         memcpy(x_before, s->x, (size_t)dim * sizeof(float));
@@ -1334,13 +1341,7 @@ static float rng_f32(uint64_t *state) {
 
 typedef struct { float p; int idx; } ProbIdx;
 
-static int cmp_prob_desc(const void *a, const void *b) {
-    float pa = ((const ProbIdx *)a)->p;
-    float pb = ((const ProbIdx *)b)->p;
-    return (pa < pb) - (pa > pb);
-}
-
-static int sample_token(float *logits, int n, float temp, float topp, uint64_t *rng) {
+static int sample_token(float *logits, int n, float temp, float topp, int topk, uint64_t *rng) {
     if (temp <= 0.0f) {
         int best = 0;
         for (int i = 1; i < n; i++)
@@ -1348,30 +1349,49 @@ static int sample_token(float *logits, int n, float temp, float topp, uint64_t *
         return best;
     }
 
-    for (int i = 0; i < n; i++) logits[i] /= temp;
-    softmax(logits, n);
+    if (topk <= 0 || topk > n) topk = n;
+    ProbIdx *pi = (ProbIdx *)malloc((size_t)topk * sizeof(ProbIdx));
+    int np = 0;
+    for (int i = 0; i < n; i++) {
+        float v = logits[i];
+        if (np < topk) {
+            int j = np++;
+            while (j > 0 && pi[j - 1].p < v) {
+                pi[j] = pi[j - 1];
+                j--;
+            }
+            pi[j].p = v;
+            pi[j].idx = i;
+        } else if (v > pi[np - 1].p) {
+            int j = np - 1;
+            while (j > 0 && pi[j - 1].p < v) {
+                pi[j] = pi[j - 1];
+                j--;
+            }
+            pi[j].p = v;
+            pi[j].idx = i;
+        }
+    }
+
+    float maxv = pi[0].p;
+    float sum = 0.0f;
+    for (int i = 0; i < np; i++) {
+        pi[i].p = expf((pi[i].p - maxv) / temp);
+        sum += pi[i].p;
+    }
+    for (int i = 0; i < np; i++) pi[i].p /= sum;
 
     float coin = rng_f32(rng);
     if (topp <= 0.0f || topp >= 1.0f) {
         float cdf = 0.0f;
-        for (int i = 0; i < n; i++) {
-            cdf += logits[i];
-            if (coin < cdf) return i;
+        int result = pi[np - 1].idx;
+        for (int i = 0; i < np; i++) {
+            cdf += pi[i].p;
+            if (coin < cdf) { result = pi[i].idx; break; }
         }
-        return n - 1;
+        free(pi);
+        return result;
     }
-
-    ProbIdx *pi = (ProbIdx *)malloc((size_t)n * sizeof(ProbIdx));
-    int np = 0;
-    float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++) {
-        if (logits[i] >= cutoff) {
-            pi[np].p = logits[i];
-            pi[np].idx = i;
-            np++;
-        }
-    }
-    qsort(pi, np, sizeof(ProbIdx), cmp_prob_desc);
 
     float cum = 0.0f;
     int last = np - 1;
@@ -1389,6 +1409,16 @@ static int sample_token(float *logits, int n, float temp, float topp, uint64_t *
     }
     free(pi);
     return result;
+}
+
+static void apply_repetition_penalty(float *logits, const int *tokens, int n_tokens, float penalty) {
+    if (penalty <= 1.0f || !tokens || n_tokens <= 0) return;
+    for (int i = 0; i < n_tokens; i++) {
+        int id = tokens[i];
+        if (id < 0) continue;
+        if (logits[id] >= 0.0f) logits[id] /= penalty;
+        else logits[id] *= penalty;
+    }
 }
 
 static int is_special(Tok *tk, int id) {
@@ -1453,14 +1483,30 @@ static int is_thought_opener(Tok *tk, int id) {
     return id == tk->channel_thought || id == tk->channel;
 }
 
+static int token_has_newline(Tok *tk, int id) {
+    if (id < 0 || id >= tk->size) return 0;
+    return memchr(tk->vocab[id], '\n', (size_t)tk->vlen[id]) != NULL;
+}
+
+static int skip_channel_label(Tok *tk, const int *tokens, int pos, int n) {
+    if (pos <= 0 || tokens[pos - 1] != tk->channel) return pos;
+    while (pos < n) {
+        int id = tokens[pos++];
+        if (token_has_newline(tk, id)) break;
+    }
+    return pos;
+}
+
 static void parse_response(Tok *tk, const int *tokens, int n,
                            char **out_thinking, char **out_answer) {
     int thought_start = -1, thought_end = -1;
     for (int i = 0; i < n; i++) {
-        if (is_thought_opener(tk, tokens[i]) && thought_start < 0)
+        if (is_thought_opener(tk, tokens[i]) && thought_start < 0) {
             thought_start = i + 1;
-        else if (tokens[i] == tk->channel_end)
+            thought_start = skip_channel_label(tk, tokens, thought_start, n);
+        } else if (tokens[i] == tk->channel_end) {
             thought_end = i;
+        }
     }
 
     if (thought_start >= 0 && thought_end > thought_start) {
@@ -1545,7 +1591,7 @@ static void throughput_summary(int n_prefill, double prefill_sec,
 
 static int generate(Model *m, int *prompt, int n_prompt,
                      int max_new, float temp, float topp, uint64_t seed,
-                     int enable_thinking, int show_thinking, TokenBuf *gen_out) {
+                     float repeat_penalty, int enable_thinking, int show_thinking, TokenBuf *gen_out) {
     uint64_t rng = seed ? seed : 1;
     int token = prompt[0];
     int gen = 0;
@@ -1554,6 +1600,8 @@ static int generate(Model *m, int *prompt, int n_prompt,
     double prefill_sec = 0.0;
     PrintMode pmode = enable_thinking ? OUT_HIDDEN : OUT_ANSWER;
     int saw_thought = 0;
+    int saw_answer = 0;
+    int skipping_channel_label = 0;
 
     if (gen_out) gen_out->n = 0;
 
@@ -1593,18 +1641,32 @@ static int generate(Model *m, int *prompt, int n_prompt,
                 clock_gettime(CLOCK_MONOTONIC, &t_decode);
                 decode_timing = 1;
             }
-            next = sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, &rng);
+            if (gen_out && repeat_penalty > 1.0f)
+                apply_repetition_penalty(m->s.logits, gen_out->tokens, gen_out->n, repeat_penalty);
+            next = sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, DEFAULT_TOP_K, &rng);
             if (next == m->tok.eos || next == m->tok.eot) break;
 
             if (enable_thinking) {
-                if (is_thought_opener(&m->tok, next)) {
+                if (!saw_thought && is_thought_opener(&m->tok, next)) {
                     saw_thought = 1;
-                    pmode = show_thinking ? OUT_THINKING : OUT_HIDDEN;
+                    pmode = OUT_HIDDEN;
+                    skipping_channel_label = (next == m->tok.channel);
                     if (show_thinking) fputs("\n--- Thinking ---\n", stderr);
                 } else if (next == m->tok.channel_end) {
-                    pmode = OUT_ANSWER;
-                    if (show_thinking && saw_thought)
+                    skipping_channel_label = 0;
+                    int entering_answer = 0;
+                    if (saw_thought && !saw_answer) {
+                        pmode = OUT_ANSWER;
+                        saw_answer = 1;
+                        entering_answer = 1;
+                    }
+                    if (show_thinking && entering_answer)
                         fputs("\n--- Answer ---\n", stderr);
+                } else if (skipping_channel_label) {
+                    if (token_has_newline(&m->tok, next)) {
+                        skipping_channel_label = 0;
+                        pmode = show_thinking ? OUT_THINKING : OUT_HIDDEN;
+                    }
                 }
             }
 
@@ -1651,7 +1713,7 @@ static char *read_user_line(const char *label) {
 }
 
 static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int show_thinking,
-                         int max_new, float temp, float topp, uint64_t seed) {
+                         int max_new, float temp, float topp, float repeat_penalty, uint64_t seed) {
     int *prompt = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
     int n_prompt = chat_encode_history(&m->tok, hist, enable_thinking, prompt, MAX_PROMPT_TOKS);
     if (n_prompt < 0) {
@@ -1666,7 +1728,7 @@ static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int s
     TokenBuf gen;
     tokenbuf_init(&gen);
     generate(m, prompt, n_prompt, max_new, temp, topp, seed,
-             enable_thinking, show_thinking, &gen);
+             repeat_penalty, enable_thinking, show_thinking, &gen);
     free(prompt);
 
     char *thinking = NULL, *answer = NULL;
@@ -1692,7 +1754,7 @@ static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int s
 }
 
 static void run_single_shot(Model *m, const char *prompt, int enable_thinking, int show_thinking,
-                            int max_new, float temp, float topp, uint64_t seed) {
+                            int max_new, float temp, float topp, float repeat_penalty, uint64_t seed) {
     int n_prompt_tokens;
     int *prompt_tokens = chat_encode(&m->tok, prompt, enable_thinking, &n_prompt_tokens);
     printf("Prompt: \"%s\" (%d tokens)%s\n\n", prompt, n_prompt_tokens,
@@ -1701,14 +1763,14 @@ static void run_single_shot(Model *m, const char *prompt, int enable_thinking, i
     TokenBuf gen;
     tokenbuf_init(&gen);
     generate(m, prompt_tokens, n_prompt_tokens, max_new, temp, topp, seed,
-             enable_thinking, show_thinking, &gen);
+             repeat_penalty, enable_thinking, show_thinking, &gen);
     free(prompt_tokens);
     tokenbuf_free(&gen);
 }
 
 static void run_interactive(Model *m, const char *initial_prompt, int enable_thinking,
                             int show_thinking, int max_new, float temp, float topp,
-                            uint64_t seed) {
+                            float repeat_penalty, uint64_t seed) {
     ChatHistory hist;
     chat_history_init(&hist);
 
@@ -1734,7 +1796,7 @@ static void run_interactive(Model *m, const char *initial_prompt, int enable_thi
         line = NULL;
 
         if (run_chat_turn(m, &hist, enable_thinking, show_thinking,
-                          max_new, temp, topp, seed) < 0)
+                          max_new, temp, topp, repeat_penalty, seed) < 0)
             break;
     }
 
@@ -1751,6 +1813,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  -n <tokens>       Max tokens to generate per turn (default: 256)\n");
         fprintf(stderr, "  -t <temp>         Temperature (default: 0.6)\n");
         fprintf(stderr, "  -k <topp>         Top-p sampling (default: 0.9)\n");
+        fprintf(stderr, "  -r <penalty>      Repetition penalty (default: 1.1, disable: 1.0)\n");
         fprintf(stderr, "  -s <seed>         Random seed (default: time)\n");
         fprintf(stderr, "  -l <len>          Max sequence length (default: 8192)\n");
         fprintf(stderr, "  -i                Interactive multi-turn mode\n");
@@ -1764,6 +1827,7 @@ int main(int argc, char *argv[]) {
     int   max_tokens = 256;
     float temp       = 0.6f;
     float topp       = 0.9f;
+    float repeat_penalty = 1.1f;
     uint64_t seed    = (uint64_t)time(NULL);
     int   max_seq    = 8192;
     int   interactive = 0;
@@ -1792,6 +1856,9 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "-n")) max_tokens = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-t")) temp       = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "-k")) topp       = (float)atof(argv[i + 1]);
+        else if (!strcmp(argv[i], "-r")) {
+            repeat_penalty = (float)atof(argv[i + 1]);
+        }
         else if (!strcmp(argv[i], "-s")) seed       = (uint64_t)strtoull(argv[i + 1], NULL, 10);
         else if (!strcmp(argv[i], "-l")) max_seq    = atoi(argv[i + 1]);
         else {
@@ -1839,10 +1906,10 @@ int main(int argc, char *argv[]) {
 
     if (interactive) {
         run_interactive(&model, prompt, enable_thinking, show_thinking,
-                        max_tokens, temp, topp, seed);
+                        max_tokens, temp, topp, repeat_penalty, seed);
     } else {
         run_single_shot(&model, prompt, enable_thinking, show_thinking,
-                        max_tokens, temp, topp, seed);
+                        max_tokens, temp, topp, repeat_penalty, seed);
     }
     free_state(&model.s);
     free_weight_ptrs(&model.w, c->n_layers);
