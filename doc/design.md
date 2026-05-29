@@ -56,6 +56,8 @@ Gemma4.c/
 
 ```
 gemma4-4b/gemma-4-E4B-it-Q4_K_M.gguf
+gemma4-4b/cpu/gemma4-cpu
+gemma4-4b/cpu-blas/gemma4-cpu-blas
 ```
 
 ## モデル取得（gemma4-4b）
@@ -102,16 +104,28 @@ make model
 
 GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`QK_K=256` ブロック単位**でスタック上に逆量子化しながら GEMV する。全重みの float 一括展開は行わない。
 
+### 実行モード
+
+| モード | 起動方法 | 説明 |
+|--------|----------|------|
+| 単発（既定） | オプションなし | `-p` のプロンプト 1 回分をエンコードし、応答を生成して終了 |
+| 対話 | `-i` / `--interactive` | stdin から複数ターンのチャット。`/quit` または `/exit` で終了。`-p` が指定されていれば最初のユーザーメッセージとして使用 |
+
+対話モードではターンごとに会話履歴を再エンコードする。履歴は最大 **128 ターン**（`MAX_CHAT_TURNS`）、プロンプト全体は最大 **8192 トークン**（`MAX_PROMPT_TOKS`）。
+
 ### コマンドラインオプション
 
 | オプション | 既定値 | 説明 |
 |------------|--------|------|
-| `-p <prompt>` | `Hello, how are you?` | ユーザープロンプト |
-| `-n <tokens>` | `256` | 最大生成トークン数 |
+| `-p <prompt>` | `Hello, how are you?` | ユーザープロンプト（単発モードの入力、または対話モードの初回メッセージ） |
+| `-n <tokens>` | `256` | ターンあたりの最大生成トークン数 |
 | `-t <temp>` | `0.6` | サンプリング温度（`0` で greedy） |
 | `-k <topp>` | `0.9` | Top-p サンプリング |
 | `-s <seed>` | 時刻 | 乱数シード |
 | `-l <len>` | `8192` | 最大シーケンス長（KV キャッシュ上限） |
+| `-i` | オフ | 対話型マルチターン モード |
+| `--think` | オフ | Thinking モード（推論トレースを生成。既定では回答のみ表示） |
+| `--show-thinking` | オフ | Thinking トレースを stderr に表示（`--think` を暗黙的に有効化） |
 
 Prefill 中は stderr に **progress bar**（`Prefill [====...]`）と、完了後に prefill / decode / total の **スループット要約**を出力する。
 
@@ -127,6 +141,15 @@ make run            # 既定 MODEL=../gemma-4-E4B-it-Q4_K_M.gguf
 
 # 例: プロンプトと生成長を指定
 ./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 64
+
+# 例: 対話モード
+./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -i
+
+# 例: Thinking モード（回答のみ表示）
+./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "Explain recursion" --think
+
+# 例: Thinking トレースも表示
+./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -i --show-thinking
 ```
 
 ### Makefile 変数（cpu）
@@ -150,7 +173,7 @@ make run            # 既定 MODEL=../gemma-4-E4B-it-Q4_K_M.gguf
 | 依存 | C11、`libopenblas`、`libgomp`（OpenMP） |
 | 並列 | OpenMP（`OMP_NUM_THREADS`）。OpenBLAS は `openblas_set_num_threads(1)` で単スレッド固定し、二重並列を避ける |
 
-`cpu/` と同じ GGUF・CLI オプション・チャット形式。起動時に OpenMP 最大スレッド数を表示する。
+`cpu/` と同一の GGUF・CLI オプション・実行モード（単発 / 対話 / Thinking）・チャット形式。起動時に OpenMP 最大スレッド数を表示する。
 
 ### 最適化の要点
 
@@ -237,12 +260,44 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 
 - **方式**: Gemma 4 BPE（`tokenizer.ggml.model` = `gemma4`）
 - **前処理**: 空白を U+2581（▁）にエスケープ、改行で分割、GPT-2 バイトフォールバックは使わない
-- **特殊トークン**: BOS=2、EOS/EOT=106（`<turn|>`）
-- **チャット**: 単一 user ターン + 生成プレフィックス
+- **特殊トークン**: BOS=2、EOS/EOT=106、`<turn|>`、`<|turn>user\n`、`<|turn>model\n`、`<|turn>system\n`、`<|think|>`、`<|channel>thought\n` / `<|channel>thought`、`<channel|>`
+
+### 単発・初回ターンのエンコード
 
 ```text
 <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
 ```
+
+### マルチターン履歴
+
+会話履歴を先頭から順に user / model ターンとして連結し、末尾に model 生成プレフィックスを付与する。
+
+```text
+<bos>
+<|turn>user\n{msg1}<turn|>\n
+<|turn>model\n{reply1}<turn|>\n
+<|turn>user\n{msg2}<turn|>\n
+<|turn>model\n
+```
+
+対話モードでは model 応答の **回答部分のみ** を履歴に保存する（Thinking トレースは履歴から除外）。
+
+### Thinking モード（`--think`）
+
+エンコード先頭に system + think ターンを付与する。
+
+```text
+<bos><|turn>system\n<|think|><turn|>\n
+...（上記 user/model 履歴）...
+<|turn>model\n
+```
+
+生成時、モデルは `<|channel>thought\n` … `<channel|>` で囲まれた推論トレースの後に回答を出力する。
+
+| オプション | 生成中の表示 | 履歴への保存 |
+|------------|--------------|--------------|
+| `--think` | 回答のみ（stdout） | 回答のみ |
+| `--show-thinking` | stderr に `--- Thinking ---` / `--- Answer ---` 見出し付きでトレースと回答 | 回答のみ |
 
 出力時は特殊トークンを表示せず、▁ を空白に戻して stdout へ書き出す。
 

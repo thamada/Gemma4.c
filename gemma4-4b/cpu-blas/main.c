@@ -65,6 +65,9 @@ static inline __m256i get_scale_shuffle_k4(int i) {
 #define QK_K            256
 #define K_SCALE_SIZE    12
 #define MAX_PROMPT_TOKS 8192
+#define MAX_GEN_TOKS    4096
+#define MAX_CHAT_TURNS  128
+#define MAX_LINE        4096
 #define MAX_Q_DIM       4096   /* 8 heads * 512 */
 #define MAX_KV_DIM      1024   /* 2 kv_heads * 512 */
 #define MAX_PLE_DIM     256
@@ -635,10 +638,28 @@ typedef struct {
     int *vlen;
     float *scores;
     int size, bos, eos, eot;
-    int turn_start, turn_end, turn_user, turn_model;
+    int turn_start, turn_end, turn_user, turn_model, turn_system;
+    int think, channel, channel_thought, channel_end;
     int *htab;
     int htab_sz;
 } Tok;
+
+enum { CHAT_USER = 0, CHAT_ASSISTANT = 1 };
+
+typedef struct {
+    int role;
+    char *text;
+} ChatMessage;
+
+typedef struct {
+    ChatMessage *msgs;
+    int n, cap;
+} ChatHistory;
+
+typedef struct {
+    int *tokens;
+    int n, cap;
+} TokenBuf;
 
 typedef struct {
     void *embd;              int embd_t;
@@ -1007,9 +1028,16 @@ static void init_tokenizer(Tok *tk, char **merges, int n_merges) {
     tk->turn_end   = tok_find_special(tk, "<turn|>");
     tk->turn_user  = tok_find_special(tk, "<|turn>user\n");
     tk->turn_model = tok_find_special(tk, "<|turn>model\n");
+    tk->turn_system = tok_find_special(tk, "<|turn>system\n");
+    tk->think = tok_find_special(tk, "<|think|>");
+    tk->channel = tok_find_special(tk, "<|channel>");
+    tk->channel_thought = tok_find_special(tk, "<|channel>thought\n");
+    if (tk->channel_thought < 0)
+        tk->channel_thought = tok_find_special(tk, "<|channel>thought");
+    tk->channel_end = tok_find_special(tk, "<channel|>");
 
-    printf("Tokenizer: %d tokens | BOS=%d EOS=%d turn_start=%d turn_end=%d\n",
-           tk->size, tk->bos, tk->eos, tk->turn_start, tk->turn_end);
+    printf("Tokenizer: %d tokens | BOS=%d EOS=%d think=%d channel=%d end=%d\n",
+           tk->size, tk->bos, tk->eos, tk->think, tk->channel, tk->channel_end);
 }
 
 static int utf8_char_len(unsigned char c) {
@@ -1141,33 +1169,121 @@ static void append_gemma_text(Tok *tk, int *out, int *n, const char *text) {
     }
 }
 
-static int *chat_encode(Tok *tk, const char *prompt, int *out_n) {
-    int *toks = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
-    int n = 0;
+static void append_turn_end(Tok *tk, int *out, int *n) {
+    if (tk->turn_end >= 0) {
+        out[(*n)++] = tk->turn_end;
+        append_str_tok(tk, out, n, "\n");
+    } else {
+        append_str_tok(tk, out, n, "<turn|>\n");
+    }
+}
 
+static void append_user_turn(Tok *tk, int *out, int *n, const char *text) {
+    if (tk->turn_user >= 0) {
+        out[(*n)++] = tk->turn_user;
+    } else {
+        append_str_tok(tk, out, n, "<|turn>user\n");
+    }
+    append_gemma_text(tk, out, n, text);
+    append_turn_end(tk, out, n);
+}
+
+static void append_model_turn(Tok *tk, int *out, int *n, const char *text) {
+    if (tk->turn_model >= 0) {
+        out[(*n)++] = tk->turn_model;
+    } else {
+        append_str_tok(tk, out, n, "<|turn>model\n");
+    }
+    append_gemma_text(tk, out, n, text);
+    append_turn_end(tk, out, n);
+}
+
+static void append_model_prefix(Tok *tk, int *out, int *n) {
+    if (tk->turn_model >= 0) {
+        out[(*n)++] = tk->turn_model;
+    } else {
+        append_str_tok(tk, out, n, "<|turn>model\n");
+    }
+}
+
+static void append_system_think_turn(Tok *tk, int *out, int *n) {
+    if (tk->turn_system >= 0) {
+        out[(*n)++] = tk->turn_system;
+    } else {
+        append_str_tok(tk, out, n, "<|turn>system\n");
+    }
+    if (tk->think >= 0) {
+        out[(*n)++] = tk->think;
+    } else {
+        append_str_tok(tk, out, n, "<|think|>");
+    }
+    append_turn_end(tk, out, n);
+}
+
+static void chat_history_init(ChatHistory *h) {
+    h->msgs = NULL;
+    h->n = 0;
+    h->cap = 0;
+}
+
+static void chat_history_free(ChatHistory *h) {
+    for (int i = 0; i < h->n; i++) free(h->msgs[i].text);
+    free(h->msgs);
+    h->msgs = NULL;
+    h->n = h->cap = 0;
+}
+
+static void chat_history_push(ChatHistory *h, int role, const char *text) {
+    if (h->n >= MAX_CHAT_TURNS) {
+        fprintf(stderr, "Error: max %d turns reached\n", MAX_CHAT_TURNS);
+        exit(1);
+    }
+    if (h->n >= h->cap) {
+        h->cap = h->cap ? h->cap * 2 : 8;
+        h->msgs = (ChatMessage *)realloc(h->msgs, (size_t)h->cap * sizeof(ChatMessage));
+    }
+    h->msgs[h->n].role = role;
+    h->msgs[h->n].text = strdup(text);
+    h->n++;
+}
+
+static int chat_encode_history(Tok *tk, const ChatHistory *hist, int enable_thinking,
+                               int *toks, int max_toks) {
+    int n = 0;
+    if (n >= max_toks) return -1;
     toks[n++] = tk->bos;
 
-    if (tk->turn_user >= 0) {
-        toks[n++] = tk->turn_user;
-    } else {
-        append_str_tok(tk, toks, &n, "<|turn>user\n");
+    if (enable_thinking) {
+        append_system_think_turn(tk, toks, &n);
+        if (n >= max_toks) return -1;
     }
 
-    append_gemma_text(tk, toks, &n, prompt);
-
-    if (tk->turn_end >= 0) {
-        toks[n++] = tk->turn_end;
-        append_str_tok(tk, toks, &n, "\n");
-    } else {
-        append_str_tok(tk, toks, &n, "<turn|>\n");
+    for (int i = 0; i < hist->n; i++) {
+        if (hist->msgs[i].role == CHAT_USER) {
+            append_user_turn(tk, toks, &n, hist->msgs[i].text);
+        } else {
+            append_model_turn(tk, toks, &n, hist->msgs[i].text);
+        }
+        if (n >= max_toks) return -1;
     }
 
-    if (tk->turn_model >= 0) {
-        toks[n++] = tk->turn_model;
-    } else {
-        append_str_tok(tk, toks, &n, "<|turn>model\n");
-    }
+    append_model_prefix(tk, toks, &n);
+    if (n >= max_toks) return -1;
+    return n;
+}
 
+static int *chat_encode(Tok *tk, const char *prompt, int enable_thinking, int *out_n) {
+    ChatHistory hist;
+    chat_history_init(&hist);
+    chat_history_push(&hist, CHAT_USER, prompt);
+    int *toks = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
+    int n = chat_encode_history(tk, &hist, enable_thinking, toks, MAX_PROMPT_TOKS);
+    chat_history_free(&hist);
+    if (n < 0) {
+        free(toks);
+        fprintf(stderr, "Error: prompt too long (max %d tokens)\n", MAX_PROMPT_TOKS);
+        exit(1);
+    }
     *out_n = n;
     return toks;
 }
@@ -1870,7 +1986,85 @@ static int sample_token(float *logits, int n, float temp, float topp, uint64_t *
 static int is_special(Tok *tk, int id) {
     return id == tk->bos || id == tk->eos || id == tk->eot ||
            id == tk->turn_start || id == tk->turn_end ||
-           id == tk->turn_user || id == tk->turn_model;
+           id == tk->turn_user || id == tk->turn_model || id == tk->turn_system ||
+           id == tk->think || id == tk->channel || id == tk->channel_thought || id == tk->channel_end;
+}
+
+typedef enum { OUT_HIDDEN = 0, OUT_THINKING = 1, OUT_ANSWER = 2 } PrintMode;
+
+static void tokenbuf_init(TokenBuf *b) {
+    b->tokens = NULL;
+    b->n = 0;
+    b->cap = 0;
+}
+
+static void tokenbuf_free(TokenBuf *b) {
+    free(b->tokens);
+    b->tokens = NULL;
+    b->n = b->cap = 0;
+}
+
+static void tokenbuf_push(TokenBuf *b, int id) {
+    if (b->n >= b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 256;
+        b->tokens = (int *)realloc(b->tokens, (size_t)b->cap * sizeof(int));
+    }
+    b->tokens[b->n++] = id;
+}
+
+static char *tokens_to_text(Tok *tk, const int *tokens, int start, int end) {
+    size_t cap = 256;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    buf[0] = 0;
+
+    for (int i = start; i < end; i++) {
+        int id = tokens[i];
+        if (id < 0 || id >= tk->size || is_special(tk, id)) continue;
+        const char *s = tk->vocab[id];
+        int slen = tk->vlen[id];
+        while (len + (size_t)slen + 1 > cap) {
+            cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+        for (int j = 0; j < slen; ) {
+            if (j + 3 <= slen && (unsigned char)s[j] == 0xE2 &&
+                (unsigned char)s[j + 1] == 0x96 && (unsigned char)s[j + 2] == 0x81) {
+                buf[len++] = ' ';
+                j += 3;
+            } else {
+                buf[len++] = s[j++];
+            }
+        }
+    }
+    buf[len] = 0;
+    return buf;
+}
+
+static int is_thought_opener(Tok *tk, int id) {
+    return id == tk->channel_thought || id == tk->channel;
+}
+
+static void parse_response(Tok *tk, const int *tokens, int n,
+                           char **out_thinking, char **out_answer) {
+    int thought_start = -1, thought_end = -1;
+    for (int i = 0; i < n; i++) {
+        if (is_thought_opener(tk, tokens[i]) && thought_start < 0)
+            thought_start = i + 1;
+        else if (tokens[i] == tk->channel_end)
+            thought_end = i;
+    }
+
+    if (thought_start >= 0 && thought_end > thought_start) {
+        if (out_thinking)
+            *out_thinking = tokens_to_text(tk, tokens, thought_start, thought_end);
+        if (out_answer)
+            *out_answer = tokens_to_text(tk, tokens, thought_end + 1, n);
+        return;
+    }
+
+    if (out_thinking) *out_thinking = NULL;
+    if (out_answer) *out_answer = tokens_to_text(tk, tokens, 0, n);
 }
 
 static void print_tok(Tok *tk, int id) {
@@ -1888,6 +2082,11 @@ static void print_tok(Tok *tk, int id) {
         }
     }
     fflush(stdout);
+}
+
+static void print_tok_mode(Tok *tk, int id, PrintMode mode) {
+    if (mode == OUT_HIDDEN) return;
+    print_tok(tk, id);
 }
 
 #define PREFILL_BAR_WIDTH 40
@@ -1936,8 +2135,9 @@ static void throughput_summary(int n_prefill, double prefill_sec,
     fprintf(stderr, "  total:   %.2f tok/s\n", total_tps);
 }
 
-static void generate(Model *m, int *prompt, int n_prompt,
-                     int max_new, float temp, float topp, uint64_t seed) {
+static int generate(Model *m, int *prompt, int n_prompt,
+                     int max_new, float temp, float topp, uint64_t seed,
+                     int enable_thinking, int show_thinking, TokenBuf *gen_out) {
     uint64_t rng = seed ? seed : 1;
     int token = prompt[0];
     int gen = 0;
@@ -1945,6 +2145,12 @@ static void generate(Model *m, int *prompt, int n_prompt,
     int decode_timing = 0;
     double prefill_sec = 0.0;
     int greedy = (temp <= 0.0f);
+    PrintMode pmode = enable_thinking ? OUT_HIDDEN : OUT_ANSWER;
+    int saw_thought = 0;
+
+    if (gen_out) {
+        gen_out->n = 0;
+    }
 
     struct timespec t0, t1, t_prefill, t_decode;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1997,8 +2203,25 @@ static void generate(Model *m, int *prompt, int n_prompt,
                 next = sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, &rng);
             }
             if (next == m->tok.eos || next == m->tok.eot) break;
+
+            if (enable_thinking) {
+                if (is_thought_opener(&m->tok, next)) {
+                    saw_thought = 1;
+                    pmode = show_thinking ? OUT_THINKING : OUT_HIDDEN;
+                    if (show_thinking) {
+                        fputs("\n--- Thinking ---\n", stderr);
+                    }
+                } else if (next == m->tok.channel_end) {
+                    pmode = OUT_ANSWER;
+                    if (show_thinking && saw_thought) {
+                        fputs("\n--- Answer ---\n", stderr);
+                    }
+                }
+            }
+
             gen++;
-            print_tok(&m->tok, next);
+            if (gen_out) tokenbuf_push(gen_out, next);
+            print_tok_mode(&m->tok, next, pmode);
         }
         token = next;
     }
@@ -2016,6 +2239,118 @@ static void generate(Model *m, int *prompt, int n_prompt,
     printf("--- %.1fs total ---\n", elapsed);
     if (prefill_reported || decode_timing)
         throughput_summary(n_prompt, prefill_sec, gen, decode_sec, elapsed);
+
+    return gen;
+}
+
+static char *read_user_line(const char *label) {
+    fprintf(stderr, "%s", label);
+    fflush(stderr);
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, stdin);
+    if (n < 0) {
+        free(line);
+        return NULL;
+    }
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (n == 0 || !strcmp(line, "/quit") || !strcmp(line, "/exit")) {
+        free(line);
+        return NULL;
+    }
+    return line;
+}
+
+static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int show_thinking,
+                         int max_new, float temp, float topp, uint64_t seed) {
+    int *prompt = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
+    int n_prompt = chat_encode_history(&m->tok, hist, enable_thinking, prompt, MAX_PROMPT_TOKS);
+    if (n_prompt < 0) {
+        fprintf(stderr, "Error: conversation too long (max %d tokens)\n", MAX_PROMPT_TOKS);
+        free(prompt);
+        return -1;
+    }
+
+    fputs("Model: ", stdout);
+    fflush(stdout);
+
+    TokenBuf gen;
+    tokenbuf_init(&gen);
+    generate(m, prompt, n_prompt, max_new, temp, topp, seed,
+             enable_thinking, show_thinking, &gen);
+    free(prompt);
+
+    char *thinking = NULL, *answer = NULL;
+    parse_response(&m->tok, gen.tokens, gen.n, &thinking, &answer);
+
+    if (enable_thinking && show_thinking && thinking && thinking[0]) {
+        fprintf(stderr, "\n[thinking stripped from history: %d chars]\n", (int)strlen(thinking));
+    }
+
+    if (!answer || !answer[0]) {
+        if (answer) free(answer);
+        free(thinking);
+        tokenbuf_free(&gen);
+        fprintf(stderr, "Warning: empty model response\n");
+        return 0;
+    }
+
+    chat_history_push(hist, CHAT_ASSISTANT, answer);
+    free(thinking);
+    free(answer);
+    tokenbuf_free(&gen);
+    return 0;
+}
+
+static void run_single_shot(Model *m, const char *prompt, int enable_thinking, int show_thinking,
+                            int max_new, float temp, float topp, uint64_t seed) {
+    int n_prompt_tokens;
+    int *prompt_tokens = chat_encode(&m->tok, prompt, enable_thinking, &n_prompt_tokens);
+    printf("Prompt: \"%s\" (%d tokens)%s\n\n", prompt, n_prompt_tokens,
+           enable_thinking ? " [thinking]" : "");
+
+    TokenBuf gen;
+    tokenbuf_init(&gen);
+    generate(m, prompt_tokens, n_prompt_tokens, max_new, temp, topp, seed,
+             enable_thinking, show_thinking, &gen);
+    free(prompt_tokens);
+    tokenbuf_free(&gen);
+}
+
+static void run_interactive(Model *m, const char *initial_prompt, int enable_thinking,
+                            int show_thinking, int max_new, float temp, float topp,
+                            uint64_t seed) {
+    ChatHistory hist;
+    chat_history_init(&hist);
+
+    fprintf(stderr, "Interactive mode ( /quit to exit )\n");
+    if (enable_thinking) {
+        fprintf(stderr, "Thinking mode: ON%s\n",
+                show_thinking ? " (showing trace)" : " (answer only)");
+    }
+
+    char *line = NULL;
+    if (initial_prompt && initial_prompt[0]) {
+        line = strdup(initial_prompt);
+    }
+
+    for (;;) {
+        if (!line) {
+            line = read_user_line("You: ");
+            if (!line) break;
+        }
+
+        chat_history_push(&hist, CHAT_USER, line);
+        free(line);
+        line = NULL;
+
+        if (run_chat_turn(m, &hist, enable_thinking, show_thinking,
+                          max_new, temp, topp, seed) < 0)
+            break;
+    }
+
+    chat_history_free(&hist);
+    fprintf(stderr, "\nBye.\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -2026,12 +2361,15 @@ int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model.gguf> [options]\n", argv[0]);
         fprintf(stderr, "Options:\n");
-        fprintf(stderr, "  -p <prompt>   User prompt (default: Hello)\n");
-        fprintf(stderr, "  -n <tokens>   Max tokens to generate (default: 256)\n");
-        fprintf(stderr, "  -t <temp>     Temperature (default: 0.6)\n");
-        fprintf(stderr, "  -k <topp>     Top-p sampling (default: 0.9)\n");
-        fprintf(stderr, "  -s <seed>     Random seed (default: time)\n");
-        fprintf(stderr, "  -l <len>      Max sequence length (default: 8192)\n");
+        fprintf(stderr, "  -p <prompt>       User prompt (default: Hello)\n");
+        fprintf(stderr, "  -n <tokens>       Max tokens to generate per turn (default: 256)\n");
+        fprintf(stderr, "  -t <temp>         Temperature (default: 0.6)\n");
+        fprintf(stderr, "  -k <topp>         Top-p sampling (default: 0.9)\n");
+        fprintf(stderr, "  -s <seed>         Random seed (default: time)\n");
+        fprintf(stderr, "  -l <len>          Max sequence length (default: 8192)\n");
+        fprintf(stderr, "  -i                Interactive multi-turn mode\n");
+        fprintf(stderr, "  --think           Enable thinking mode\n");
+        fprintf(stderr, "  --show-thinking   Show reasoning trace (requires --think)\n");
         return 1;
     }
 
@@ -2042,14 +2380,39 @@ int main(int argc, char *argv[]) {
     float topp       = 0.9f;
     uint64_t seed    = (uint64_t)time(NULL);
     int   max_seq    = 8192;
+    int   interactive = 0;
+    int   enable_thinking = 0;
+    int   show_thinking = 0;
 
-    for (int i = 2; i + 1 < argc; i += 2) {
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) {
+            interactive = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--think")) {
+            enable_thinking = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--show-thinking")) {
+            enable_thinking = 1;
+            show_thinking = 1;
+            continue;
+        }
+        if (i + 1 >= argc) {
+            fprintf(stderr, "Error: option %s requires a value\n", argv[i]);
+            return 1;
+        }
         if      (!strcmp(argv[i], "-p")) prompt     = argv[i + 1];
         else if (!strcmp(argv[i], "-n")) max_tokens = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-t")) temp       = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "-k")) topp       = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "-s")) seed       = (uint64_t)strtoull(argv[i + 1], NULL, 10);
         else if (!strcmp(argv[i], "-l")) max_seq    = atoi(argv[i + 1]);
+        else {
+            fprintf(stderr, "Error: unknown option %s\n", argv[i]);
+            return 1;
+        }
+        i++;
     }
 
     printf("Loading %s ...\n", model_path);
@@ -2088,13 +2451,13 @@ int main(int argc, char *argv[]) {
     init_tokenizer(&model.tok, merges, n_merges);
     alloc_state(&model.s, c);
 
-    int n_prompt_tokens;
-    int *prompt_tokens = chat_encode(&model.tok, prompt, &n_prompt_tokens);
-    printf("Prompt: \"%s\" (%d tokens)\n\n", prompt, n_prompt_tokens);
-
-    generate(&model, prompt_tokens, n_prompt_tokens, max_tokens, temp, topp, seed);
-
-    free(prompt_tokens);
+    if (interactive) {
+        run_interactive(&model, prompt, enable_thinking, show_thinking,
+                        max_tokens, temp, topp, seed);
+    } else {
+        run_single_shot(&model, prompt, enable_thinking, show_thinking,
+                        max_tokens, temp, topp, seed);
+    }
     free_state(&model.s);
     free_weight_ptrs(&model.w, c->n_layers);
     free(c->swa_layers);
