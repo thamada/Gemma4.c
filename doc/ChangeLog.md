@@ -4,6 +4,21 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-30 04:06:35 — 対話モード・Thinking モードの追加
+
+- `gemma4-4b/cpu/main.c` / `cpu-blas/main.c`: マルチターン対話と Thinking モードを追加
+  - `-i` / `--interactive`: stdin から複数ターンのチャット（`/quit` / `/exit` で終了）
+  - `--think`: `<|turn>system\n<|think|>` プレフィックス付きエンコード、`<|channel>thought\n` … `<channel|>` 区間の推論トレース生成
+  - `--show-thinking`: 推論トレースを stderr に表示（既定は回答のみ stdout）
+  - `ChatHistory` による会話履歴管理（最大 128 ターン）。履歴には回答テキストのみ保存
+  - トークナイザー特殊トークン: `turn_system`, `think`, `channel`, `channel_thought`, `channel_end`
+- `doc/design.md`: 実行モード・CLI オプション・チャット / Thinking 形式を追記
+
+## 2026-05-30 03:33:13 — ビルド生成物を Git 管理外に設定
+
+- `.gitignore`: `gemma4-4b/cpu/gemma4-cpu` と `gemma4-4b/cpu-blas/gemma4-cpu-blas` を追加
+- `doc/design.md`: Git 管理方針の `.gitignore` 記載を更新
+
 ## 2026-05-30 03:28:28 — gemma4-4b CPU-BLAS 推論実装の追加
 
 - `gemma4-4b/cpu-blas/` ディレクトリを追加
