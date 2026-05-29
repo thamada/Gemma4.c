@@ -34,7 +34,7 @@
 
 extern void openblas_set_num_threads(int num_threads);
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(GEMMA4_USE_GENERIC_DOT)
 #include <immintrin.h>
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
@@ -278,7 +278,7 @@ static void quantize_row_q8_K_ref(const float *x, BlockQ8_K *y, int k) {
     }
 }
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(GEMMA4_USE_GENERIC_DOT)
 static void quantize_row_q8_K(const float *x, BlockQ8_K *y, int k) {
     const int nb = k / QK_K;
     const __m256 signBit = _mm256_set1_ps(-0.0f);
@@ -472,7 +472,7 @@ static void vec_dot_q5_K_q8_K_generic(int n, const BlockQ5_K *x, const BlockQ8_K
     *out = sumf;
 }
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(GEMMA4_USE_GENERIC_DOT)
 static void vec_dot_q4_K_q8_K(int n, const BlockQ4_K *x, const BlockQ8_K *y, float *out) {
     const int nb = n / QK_K;
     static const uint32_t kmask1 = 0x3f3f3f3f;
@@ -1799,6 +1799,24 @@ static float *vc_at(State *s, int layer, int pos, int max_seq) {
     return s->vc + kv_cache_offset(layer, pos, 0, max_seq);
 }
 
+static int g_dump_hidden_at = -1;
+static int g_dump_final_hidden_pos = -1;
+
+static void hidden_stats(const float *v, int n, float *out_sum, float *out_l2, float *out_max) {
+    double sum = 0.0, l2 = 0.0;
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float x = v[i];
+        sum += x;
+        l2 += (double)x * x;
+        float ax = x >= 0.0f ? x : -x;
+        if (ax > amax) amax = ax;
+    }
+    *out_sum = (float)sum;
+    *out_l2 = (float)sqrt(l2);
+    *out_max = amax;
+}
+
 static void forward(Model *m, int token, int pos, int lm_mode) {
     Config *c = &m->cfg;
     Weights *w = &m->w;
@@ -1818,6 +1836,13 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
     }
 
     build_ple(m, token, s->ple);
+
+    if (g_dump_hidden_at == pos) {
+        float sum, l2, amax;
+        hidden_stats(s->x, dim, &sum, &l2, &amax);
+        fprintf(stderr, "[hidden pos %d] after_emb sum=%.4f l2=%.4f max=%.4f\n",
+                pos, sum, l2, amax);
+    }
 
     for (int l = 0; l < c->n_layers; l++) {
         int hd = layer_head_dim(c, l);
@@ -1928,11 +1953,30 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
             #pragma omp parallel for schedule(static)
             for (int i = 0; i < dim; i++) s->x[i] *= sc;
         }
+
+        if (g_dump_hidden_at == pos) {
+            float sum, l2, amax;
+            hidden_stats(s->x, dim, &sum, &l2, &amax);
+            fprintf(stderr, "[hidden pos %d] layer %2d sum=%.4f l2=%.4f max=%.4f\n",
+                    pos, l, sum, l2, amax);
+        }
     }
 
     if (lm_mode == 0) return;
 
+    if (g_dump_final_hidden_pos == pos) {
+        float sum, l2, amax;
+        hidden_stats(s->x, dim, &sum, &l2, &amax);
+        fprintf(stderr, "[hidden pos %d] pre_final_norm sum=%.4f l2=%.4f max=%.4f\n",
+                pos, sum, l2, amax);
+    }
     rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
+    if (g_dump_final_hidden_pos == pos) {
+        float sum, l2, amax;
+        hidden_stats(s->x, dim, &sum, &l2, &amax);
+        fprintf(stderr, "[hidden pos %d] final_norm sum=%.4f l2=%.4f max=%.4f\n",
+                pos, sum, l2, amax);
+    }
     logits_tied(m, s->logits, lm_mode);
 }
 
@@ -2201,10 +2245,50 @@ static void throughput_summary(int n_prefill, double prefill_sec,
     fprintf(stderr, "  total:   %.2f tok/s\n", total_tps);
 }
 
+static int *parse_token_list(const char *s, int *out_n) {
+    int cap = 64, n = 0;
+    int *toks = (int *)malloc((size_t)cap * sizeof(int));
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        if (n >= cap) {
+            cap *= 2;
+            toks = (int *)realloc(toks, (size_t)cap * sizeof(int));
+        }
+        toks[n++] = (int)v;
+        p = end;
+    }
+    *out_n = n;
+    return toks;
+}
+
+static void dump_logits_top(const float *logits, int n, int k) {
+    int *idx = (int *)malloc((size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) idx[i] = i;
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (logits[idx[j]] > logits[idx[i]]) {
+                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+            }
+        }
+    }
+    if (k > n) k = n;
+    fprintf(stderr, "  top-%d logits:", k);
+    for (int i = 0; i < k; i++)
+        fprintf(stderr, " %d=%.4f", idx[i], logits[idx[i]]);
+    fputc('\n', stderr);
+    free(idx);
+}
+
 static int generate(Model *m, int *prompt, int n_prompt,
                      int max_new, float temp, float topp, uint64_t seed,
                      float repeat_penalty, int penalty_last_n,
                      int enable_thinking, int show_thinking, int thinking_budget,
+                     const int *force_tokens, int force_n, int dump_logits_at,
                      TokenBuf *gen_out) {
     uint64_t rng = seed ? seed : 1;
     int token = prompt[0];
@@ -2246,6 +2330,9 @@ static int generate(Model *m, int *prompt, int n_prompt,
             lm_mode = 1; /* full logits */
         }
 
+        g_dump_final_hidden_pos = (dump_logits_at >= 0 && pos == n_prompt - 1 + dump_logits_at)
+            ? pos : -1;
+
         forward(m, token, pos, lm_mode);
 
         if (n_prompt > 0 && pos < n_prompt) {
@@ -2284,12 +2371,18 @@ static int generate(Model *m, int *prompt, int n_prompt,
                     thinking_budget_warned = 1;
                 }
                 next = m->tok.channel_end;
+            } else if (force_tokens && gen < force_n) {
+                next = force_tokens[gen];
             } else if (fast_argmax) {
                 next = m->s.argmax_tok;
             } else if (greedy) {
                 next = sample_token(m->s.logits, m->cfg.vocab_size, 0.0f, topp, DEFAULT_TOP_K, &rng);
             } else {
                 next = sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, DEFAULT_TOP_K, &rng);
+            }
+            if (dump_logits_at >= 0 && gen == dump_logits_at) {
+                fprintf(stderr, "[logits at gen step %d, pos %d]\n", gen, pos);
+                dump_logits_top(m->s.logits, m->cfg.vocab_size, 8);
             }
             if (next == m->tok.eos || next == m->tok.eot) break;
 
@@ -2366,7 +2459,9 @@ static char *read_user_line(const char *label) {
 
 static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int show_thinking,
                          int max_new, float temp, float topp, float repeat_penalty,
-                         int penalty_last_n, int thinking_budget, uint64_t seed) {
+                         int penalty_last_n, int thinking_budget,
+                         const int *force_tokens, int force_n, int dump_logits_at,
+                         uint64_t seed) {
     int *prompt = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
     int n_prompt = chat_encode_history(&m->tok, hist, enable_thinking, prompt, MAX_PROMPT_TOKS);
     if (n_prompt < 0) {
@@ -2382,7 +2477,7 @@ static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int s
     tokenbuf_init(&gen);
     generate(m, prompt, n_prompt, max_new, temp, topp, seed,
              repeat_penalty, penalty_last_n, enable_thinking, show_thinking,
-             thinking_budget, &gen);
+             thinking_budget, force_tokens, force_n, dump_logits_at, &gen);
     free(prompt);
 
     char *thinking = NULL, *answer = NULL;
@@ -2410,6 +2505,7 @@ static int run_chat_turn(Model *m, ChatHistory *hist, int enable_thinking, int s
 static void run_single_shot(Model *m, const char *prompt, int enable_thinking, int show_thinking,
                             int max_new, float temp, float topp, float repeat_penalty,
                             int penalty_last_n, int thinking_budget,
+                            const int *force_tokens, int force_n, int dump_logits_at,
                             int dump_prompt, int dump_gen, uint64_t seed) {
     int n_prompt_tokens;
     int *prompt_tokens = chat_encode(&m->tok, prompt, enable_thinking, &n_prompt_tokens);
@@ -2426,7 +2522,7 @@ static void run_single_shot(Model *m, const char *prompt, int enable_thinking, i
     tokenbuf_init(&gen);
     generate(m, prompt_tokens, n_prompt_tokens, max_new, temp, topp, seed,
              repeat_penalty, penalty_last_n, enable_thinking, show_thinking,
-             thinking_budget, &gen);
+             thinking_budget, force_tokens, force_n, dump_logits_at, &gen);
     if (dump_gen) {
         fprintf(stderr, "Generated token IDs:");
         for (int i = 0; i < gen.n; i++)
@@ -2440,6 +2536,7 @@ static void run_single_shot(Model *m, const char *prompt, int enable_thinking, i
 static void run_interactive(Model *m, const char *initial_prompt, int enable_thinking,
                             int show_thinking, int max_new, float temp, float topp,
                             float repeat_penalty, int penalty_last_n, int thinking_budget,
+                            const int *force_tokens, int force_n, int dump_logits_at,
                             uint64_t seed) {
     ChatHistory hist;
     chat_history_init(&hist);
@@ -2469,7 +2566,7 @@ static void run_interactive(Model *m, const char *initial_prompt, int enable_thi
 
         if (run_chat_turn(m, &hist, enable_thinking, show_thinking,
                           max_new, temp, topp, repeat_penalty, penalty_last_n,
-                          thinking_budget, seed) < 0)
+                          thinking_budget, force_tokens, force_n, dump_logits_at, seed) < 0)
             break;
     }
 
@@ -2520,6 +2617,9 @@ int main(int argc, char *argv[]) {
     int   dump_gen = 0;
     int   thinking_budget = -1;
     int   thinking_budget_user = 0;
+    int  *force_tokens = NULL;
+    int   force_n = 0;
+    int   dump_logits_at = -1;
 
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) {
@@ -2550,6 +2650,33 @@ int main(int argc, char *argv[]) {
             }
             thinking_budget = atoi(argv[i + 1]);
             thinking_budget_user = 1;
+            i++;
+            continue;
+        }
+        if (!strcmp(argv[i], "--force-gen")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: option %s requires a value\n", argv[i]);
+                return 1;
+            }
+            force_tokens = parse_token_list(argv[i + 1], &force_n);
+            i++;
+            continue;
+        }
+        if (!strcmp(argv[i], "--dump-logits-at")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: option %s requires a value\n", argv[i]);
+                return 1;
+            }
+            dump_logits_at = atoi(argv[i + 1]);
+            i++;
+            continue;
+        }
+        if (!strcmp(argv[i], "--dump-hidden-at")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: option %s requires a value\n", argv[i]);
+                return 1;
+            }
+            g_dump_hidden_at = atoi(argv[i + 1]);
             i++;
             continue;
         }
@@ -2618,12 +2745,14 @@ int main(int argc, char *argv[]) {
     if (interactive) {
         run_interactive(&model, prompt, enable_thinking, show_thinking,
                         max_tokens, temp, topp, repeat_penalty, penalty_last_n,
-                        thinking_budget, seed);
+                        thinking_budget, force_tokens, force_n, dump_logits_at, seed);
     } else {
         run_single_shot(&model, prompt, enable_thinking, show_thinking,
                         max_tokens, temp, topp, repeat_penalty, penalty_last_n,
-                        thinking_budget, dump_prompt, dump_gen, seed);
+                        thinking_budget, force_tokens, force_n, dump_logits_at,
+                        dump_prompt, dump_gen, seed);
     }
+    free(force_tokens);
     free_state(&model.s);
     free_weight_ptrs(&model.w, c->n_layers);
     free(c->swa_layers);
