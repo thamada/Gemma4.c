@@ -167,6 +167,34 @@ pos 37（gen step 18 相当）の層出力 sum / L2 / max を層ごとに記録�
 
 ---
 
+## 2026-05-30 08:42:04 — F32 matmul 切り分け: Q4/Q5 量子化 matmul は主因ではない
+
+### 実施内容
+
+- `gemma4-4b/cpu-blas/main.c`: デバッグ用 **`--f32-matmul`** を追加
+  - Q4_K / Q5_K 重みを **F32 dequant 後に matmul**（`mm_quant_rows` 経路）。Q8_K 活性化量子化をバイパス
+- `tools/llama_dump_logits.cpp`: teacher forcing 後の **hidden（embeddings API）** ダンプを安定化
+
+### 同一 prefix（20 prompt + llama 25 gen token 強制）gen step 25 の比較
+
+| 指標 | llama.cpp | Gemma4.c（Q8 既定） | Gemma4.c（`--f32-matmul`） |
+|------|-----------|---------------------|----------------------------|
+| top-1 logit | **2267=26.98** | 3689=25.14 | 3689=25.14 |
+| 2267 | 1 位 | 6 位（23.08） | 5 位（23.16） |
+| pre_final L2 | — | 55.10 | 55.29 |
+| final hidden L2（llama embeddings / Gemma4 final_norm） | **300.44** | 193.17 | （ほぼ同値） |
+
+### 結論（前回仮説の修正）
+
+- **`--f32-matmul` でも logits / hidden はほぼ不変** → Gemma4 内部の Q4_K×Q8_K 内積と F32 dequant 経路は **同等精度** であり、**Q4 量子化 matmul 単体が llama との差の主因ではない**
+- llama との差は **Attention / KV cache / RoPE / PLE / Q6_K 経路** など、フォワード pass の別箇所に起因する可能性が高い
+- gen step 25 時点で llama hidden L2（300.44）と Gemma4 final_norm L2（193.17）に **大きな乖離** → 層単位 diff の継続が必要
+
+### 次の作業
+
+- llama `llama-eval-callback` と Gemma4 `--dump-hidden-at` で **同一 token 列・同一 pos の層出力** を突合
+- Attention（`cblas_sgemv` + KV レイアウト + SWA ウィンドウ + KV 再利用）を llama `llama_kv_cache_iswa` と照合
+
 ### 関連 ChangeLog エントリ
 
 - `2026-05-30 06:46:19` — サンプラー修正・プロンプト token 一致確認（フォワード乖離の**推定**段階）
