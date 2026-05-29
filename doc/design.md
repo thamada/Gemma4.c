@@ -6,12 +6,18 @@
 
 Gemma4.c は **Gemma 4 E4B**（主に `gemma-4-E4B-it-Q4_K_M.gguf`）を **C 言語**で推論するためのリポジトリです。PyTorch 等の ML ランタイムには依存せず、GGUF の mmap 読み取り・トークナイズ・Transformer フォワード・サンプリングを単一ソースに集約しています。
 
+主な機能:
+
+- **単発推論**: 1 プロンプトに対する応答生成
+- **マルチターン対話** (`-i`): stdin から複数ターンのチャット、会話履歴の再エンコード
+- **Thinking モード** (`--think`): Gemma 4 の `<|think|>` / `<|channel>` 形式による推論トレース生成
+
 | 実装 | パス | 依存 | 用途 |
 |------|------|------|------|
 | 参照（単スレッド） | `gemma4-4b/cpu/` | C11 + `libm` のみ | 正しさ・可読性優先のベースライン |
 | 高速（CPU） | `gemma4-4b/cpu-blas/` | OpenBLAS + OpenMP + `libm` | マルチスレッド GEMV・Q8_K 内積による実用速度 |
 
-両実装は同一デコーダ（ISWA、共有 KV、PLE、タイド LM ヘッド、logit softcapping）を共有する。
+両実装は同一デコーダ（ISWA、共有 KV、PLE、タイド LM ヘッド、logit softcapping）・同一 CLI・同一チャット形式を共有する。
 
 大容量の GGUF モデルファイルは Git 管理外とし、リポジトリには取得手順・整合性検証用チェックサム・上記 CPU 推論実装を含めます。
 
@@ -111,23 +117,37 @@ GGUF を `mmap` で読み込み、量子化重み（Q4_K / Q5_K / Q6_K）は **`
 | 単発（既定） | オプションなし | `-p` のプロンプト 1 回分をエンコードし、応答を生成して終了 |
 | 対話 | `-i` / `--interactive` | stdin から複数ターンのチャット。`/quit` または `/exit` で終了。`-p` が指定されていれば最初のユーザーメッセージとして使用 |
 
-対話モードではターンごとに会話履歴を再エンコードする。履歴は最大 **128 ターン**（`MAX_CHAT_TURNS`）、プロンプト全体は最大 **8192 トークン**（`MAX_PROMPT_TOKS`）。
+対話モードではターンごとに会話履歴を再エンコードする。履歴は最大 **128 ターン**（`MAX_CHAT_TURNS`）、プロンプト全体は最大 **8192 トークン**（`MAX_PROMPT_TOKS`）、1 行の入力は最大 **4096 バイト**（`MAX_LINE`）。
 
 ### コマンドラインオプション
 
 | オプション | 既定値 | 説明 |
 |------------|--------|------|
 | `-p <prompt>` | `Hello, how are you?` | ユーザープロンプト（単発モードの入力、または対話モードの初回メッセージ） |
-| `-n <tokens>` | `256` | ターンあたりの最大生成トークン数 |
+| `-n <tokens>` | `256` | ターンあたりの最大生成トークン数（内部上限 `MAX_GEN_TOKS=4096`） |
 | `-t <temp>` | `0.6` | サンプリング温度（`0` で greedy） |
 | `-k <topp>` | `0.9` | Top-p サンプリング |
+| `-r <penalty>` | `1.1` | Repetition penalty（`-r 1.0` で無効化） |
 | `-s <seed>` | 時刻 | 乱数シード |
 | `-l <len>` | `8192` | 最大シーケンス長（KV キャッシュ上限） |
-| `-i` | オフ | 対話型マルチターン モード |
+| `-i` / `--interactive` | オフ | 対話型マルチターン モード |
 | `--think` | オフ | Thinking モード（推論トレースを生成。既定では回答のみ表示） |
 | `--show-thinking` | オフ | Thinking トレースを stderr に表示（`--think` を暗黙的に有効化） |
 
+`cpu-blas` も上記と同一の CLI オプションを受け付ける。
+
 Prefill 中は stderr に **progress bar**（`Prefill [====...]`）と、完了後に prefill / decode / total の **スループット要約**を出力する。
+
+### サンプリング
+
+llama.cpp の Gemma 4 既定に近い順序でサンプリングする。
+
+1. **Repetition penalty**（`-r`、既定 `1.1`）: 生成済みトークンの logit に符号に応じた penalty を適用
+2. **Top-k**（固定 `40`、`DEFAULT_TOP_K`）: logit 上位 k 件に候補を絞る
+3. **Temperature**（`-t`）: softmax 前に logit をスケール（`0` で argmax）
+4. **Top-p**（`-k`）: 累積確率で nucleus サンプリング
+
+Top-k は CLI から変更できない。反復ループが目立つ場合は `-r` を上げるか、`-t` を下げる。
 
 ### ビルド・実行例
 
@@ -150,6 +170,12 @@ make run            # 既定 MODEL=../gemma-4-E4B-it-Q4_K_M.gguf
 
 # 例: Thinking トレースも表示
 ./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -i --show-thinking
+
+# 例: 日本語プロンプト（add_space_prefix により先頭空白が自動付与）
+./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "あなたは何者?" -n 128
+
+# 例: repetition penalty を無効化
+./gemma4-cpu ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -r 1.0
 ```
 
 ### Makefile 変数（cpu）
@@ -251,7 +277,7 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 
 1. `token_embd` ルックアップ × `√dim`
 2. PLE 構築
-3. 各層: Pre-Attn RMSNorm → Q/K/V → Q/K norm、V は重みなし RMSNorm → RoPE（Full は `rope_freqs`）→ Attention（SWA は直近 512 トークン）→ 出力投影 → Post-Attn RMSNorm → 残差
+3. 各層: Pre-Attn RMSNorm → Q/K/V → Q/K norm、V は重みなし RMSNorm → RoPE（Full は `rope_freqs`）→ Attention（SWA は直近 512 トークン、スケール係数 `1.0`）→ 出力投影 → Post-Attn RMSNorm → 残差
 4. FFN: Pre-FFN RMSNorm → 並列 GELU FFN（`gelu(gate) * up`）→ Post-FFW RMSNorm → 残差
 5. PLE 注入 → `layer_output_scale`（学習可能スカラー、存在する場合）
 6. `output_norm` → タイド LM ヘッド → logit softcapping
@@ -259,7 +285,7 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 ## トークナイザーとチャット形式
 
 - **方式**: Gemma 4 BPE（`tokenizer.ggml.model` = `gemma4`）
-- **前処理**: 空白を U+2581（▁）にエスケープ、改行で分割、GPT-2 バイトフォールバックは使わない
+- **前処理**: `tokenizer.ggml.add_space_prefix` に従って非空行の先頭へ U+2581（▁）を付与し、空白も U+2581 にエスケープ、改行で分割する。GPT-2 バイトフォールバックは使わない
 - **特殊トークン**: BOS=2、EOS/EOT=106、`<turn|>`、`<|turn>user\n`、`<|turn>model\n`、`<|turn>system\n`、`<|think|>`、`<|channel>thought\n` / `<|channel>thought`、`<channel|>`
 
 ### 単発・初回ターンのエンコード
@@ -287,12 +313,14 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 エンコード先頭に system + think ターンを付与する。
 
 ```text
-<bos><|turn>system\n<|think|><turn|>\n
+<bos><|turn>system\n<|think|>\n<turn|>\n
 ...（上記 user/model 履歴）...
 <|turn>model\n
 ```
 
-生成時、モデルは `<|channel>thought\n` … `<channel|>` で囲まれた推論トレースの後に回答を出力する。
+生成時、モデルは `<|channel>thought\n` … `<channel|>` で囲まれた推論トレースの後に回答を出力する。GGUF 語彙では `<|channel>thought\n` が `<|channel>` + 通常トークン列に分かれる場合があるため、実装は `<|channel>` / `<channel|>` を境界として扱う。
+
+サンプリングの詳細は「サンプリング」節を参照。
 
 | オプション | 生成中の表示 | 履歴への保存 |
 |------------|--------------|--------------|
@@ -300,6 +328,12 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 | `--show-thinking` | stderr に `--- Thinking ---` / `--- Answer ---` 見出し付きでトレースと回答 | 回答のみ |
 
 出力時は特殊トークンを表示せず、▁ を空白に戻して stdout へ書き出す。
+
+### 既知の制限
+
+- **Thinking モードの品質**: `<|channel>` / `<channel|>` の状態遷移と表示分離は動作するが、同一 GGUF を llama.cpp で実行した場合と比べ、推論トレースの内容品質が劣ることがある。通常モード（`--think` なし）の応答品質は llama.cpp と同等に近い。
+- **Top-k 固定**: `DEFAULT_TOP_K=40` は CLI から変更不可。
+- **共有 KV**: GGUF には全 42 層分の K/V 重みが存在するが、推論は `N_LAYER_KV=24`（層 0–23 が KV を書き込み、24–41 が再利用）で行う。全層独立 KV に変更すると通常モードの出力が破綻するため、llama.cpp の `shared_kv_layers` 設計に従う。
 
 ## ライセンス
 
