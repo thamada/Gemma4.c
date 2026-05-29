@@ -4,6 +4,17 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-30 03:28:28 — gemma4-4b CPU-BLAS 推論実装の追加
+
+- `gemma4-4b/cpu-blas/` ディレクトリを追加
+- `main.c`: `cpu/` と同一デコーダを OpenBLAS + OpenMP で高速化
+  - F32: 行帯並列 + `cblas_sgemv`
+  - Q4_K / Q5_K: 活性化 Q8_K + 整数内積（AVX2 時 SIMD）
+  - Attention: ヘッド単位 BLAS、OpenBLAS は 1 スレッド固定
+- `cpu-blas/Makefile`: `make build` / `make run` / `make openblas`（`libopenblas-dev` 等）
+- `gemma-4-E4B-it-Q4_K_M.gguf.sha256sum`: Q4_K_M 用チェックサム行を追加（Q8_0 行は維持）
+- `doc/design.md`: 二系統 CPU 実装・cpu-blas ビルド手順を追記
+
 ## 2026-05-29 18:00:01 — gemma4-4b CPU 推論実装の追加
 
 - `gemma4-4b/cpu/` ディレクトリを追加
