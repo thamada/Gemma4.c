@@ -138,9 +138,7 @@ int main(int argc, char **argv) {
         if ((int)force.size() > i) tok = (llama_token)force[i];
         else tok = llama_sampler_sample(smpl, ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) break;
-        llama_batch batch = llama_batch_get_one(&tok, 1);
-        batch.logits[0] = 1;
-        if (llama_decode(ctx, batch)) {
+        if (llama_decode(ctx, llama_batch_get_one(&tok, 1))) {
             fprintf(stderr, "decode failed at %d\n", i);
             break;
         }

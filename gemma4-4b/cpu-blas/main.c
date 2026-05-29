@@ -1565,6 +1565,8 @@ static void mm_quant_dot_rows(float *o, const void *w, int n, int d, int type, c
     }
 }
 
+static int g_f32_matmul = 0;
+
 static int mm_argmax_row(const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
     int best_i = 0;
     float best_v = -INFINITY;
@@ -1674,6 +1676,10 @@ static void mm(float *o, const float *x, const void *w, int n, int d, int type,
         if (n % QK_K) {
             fprintf(stderr, "mm: n=%d not multiple of QK_K\n", n);
             exit(1);
+        }
+        if (g_f32_matmul) {
+            mm_quant_rows(o, x, w, n, d, type);
+            break;
         }
         if (!q8_ready) quantize_row_q8_K(x, q8, n);
         mm_quant_dot_rows(o, w, n, d, type, q8);
@@ -2598,6 +2604,10 @@ int main(int argc, char *argv[]) {
                 DEFAULT_THINKING_BUDGET);
         fprintf(stderr, "  --dump-prompt     Print prompt token IDs to stderr\n");
         fprintf(stderr, "  --dump-gen        Print generated token IDs to stderr\n");
+        fprintf(stderr, "  --dump-logits-at <n>  Dump top logits at generation step n\n");
+        fprintf(stderr, "  --dump-hidden-at <pos>  Dump hidden stats per layer at sequence pos\n");
+        fprintf(stderr, "  --force-gen <ids> Force greedy token IDs (comma-separated)\n");
+        fprintf(stderr, "  --f32-matmul      Dequant Q4/Q5 weights to F32 for matmul (slow, debug)\n");
         return 1;
     }
 
@@ -2678,6 +2688,10 @@ int main(int argc, char *argv[]) {
             }
             g_dump_hidden_at = atoi(argv[i + 1]);
             i++;
+            continue;
+        }
+        if (!strcmp(argv[i], "--f32-matmul")) {
+            g_f32_matmul = 1;
             continue;
         }
         if (i + 1 >= argc) {
