@@ -9,7 +9,7 @@ CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter -fopenmp -march=nati
 LDFLAGS ?= -fopenmp -lopenblas -lm
 
 MODEL   ?= ../gemma-4-E4B-it-Q4_K_M.gguf
-PROMPT  ?= Hello, how are you?
+PROMPT  ?= あなたは何者?
 
 OPENBLAS_CFLAGS := $(shell pkg-config --cflags openblas 2>/dev/null)
 OPENBLAS_LIBS   := $(shell pkg-config --libs openblas 2>/dev/null)
@@ -41,7 +41,7 @@ build:
 	fi
 
 run: build
-	./gemma4-cpu-blas "$(MODEL)" -p "$(PROMPT)"
+	./gemma4-cpu-blas "$(MODEL)" -p "$(PROMPT)" -n 8192 -t 0.7 -k 0.95 --think --show-thinking --thinking-budget 128
 
 # Debian/Ubuntu 等: libopenblas-dev + OpenMP ランタイム
 openblas:
