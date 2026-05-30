@@ -4,6 +4,21 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-30 17:54:08 — README 敬意表明・読み方セクション修正
+
+- `README.md`:
+  - 「実装コードを読む方へ」節の見出し・導入文を修正（実装を読む順序の案内に整合）
+  - **llama.cpp への敬意**: 依存関係なし・処理内容を参考にしている旨を明記（URL: `https://github.com/ggml-org/llama.cpp`）
+  - **Google（Gemma 4）への敬意**: Gemma 4 の Apache License 2.0 配布への感謝を明記（URL: `https://ai.google.dev/gemma/docs/core?hl=en`）
+- `doc/design.md`: ライセンス節に Gemma 4 公式リンク・Apache 2.0 配布の注記、llama.cpp / Google への敬意節を追記
+
+## 2026-05-30 17:19:24 — `make run` を Thinking モードのデモ実行に更新
+
+- `gemma4-4b/cpu-blas/Makefile`:
+  - 既定 `PROMPT` を `あなたは何者?` に変更（RoPE 修正後の Thinking 品質確認用）
+  - `make run` が `-n 8192 -t 0.7 -k 0.95 --think --show-thinking --thinking-budget 128` を付与するよう更新
+- `doc/design.md`: Makefile 変数・`make run` の説明を上記に合わせて更新
+
 ## 2026-05-30 10:38:02 — 設計仕様書のフルスクラッチ拡充と README 追加
 
 - `README.md`: リポジトリ概要、ML フレームワーク非依存の方針、クイックスタート、`doc/design.md` への導線
