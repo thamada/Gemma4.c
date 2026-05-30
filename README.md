@@ -289,9 +289,9 @@ Gemma 4 の推論トレース（thinking）を生成するモードです。
 
 ---
 
-## 実装を読きたい人へ
+## 実装コードを読む方へ
 
-**はじめて LLM をフルスクラッチから実装する** 場合は、次の順番がおすすめです。
+このリポジトリの実装を初めて読む場合は、次の順番で進めるとわかりやすいです。
 
 1. **この README** — まずビルドと実行を成功させる。
 2. **`doc/design.md` の概要と §推論ループ** — Prefill / Decode の全体像を把握する。
@@ -392,3 +392,15 @@ cd gemma4-4b/cpu-blas && make clean
 ## ライセンス
 
 本リポジトリのソースおよびドキュメントは [Apache License 2.0](LICENSE) に従います。GGUF モデル本体の利用条件は配布元（[unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) / Google）のライセンスに従います。
+
+---
+
+## llama.cpp への敬意
+
+[llama.cpp](https://github.com/ggml-org/llama.cpp) と本実装の間に、ライブラリのリンクなどを含む**依存関係は一切ありません**。一方で、GGUF の扱い方や Gemma 4 の推論手順、数値検証の参照として、llama.cpp の処理内容を参考にしています。本リポジトリは、llama.cpp という優れた OSS に敬意を表します。
+
+---
+
+## Google（Gemma 4）への敬意
+
+[Gemma 4](https://ai.google.dev/gemma/docs/core?hl=en) を開発・公開してくださった Google に敬意を表します。特に、Gemma 4 が **Apache License 2.0** で配布されるようになったことは、これまでの世代とは大きく異なり、研究・実装・改変の自由度が広がった点で非常にありがたいものです。本リポジトリは、Gemma 4 というオープンなモデルを公開してくださった Google に感謝します。

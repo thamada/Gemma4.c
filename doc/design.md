@@ -40,6 +40,7 @@ Gemma4.c は **Gemma 4 E4B**（主に `gemma-4-E4B-it-Q4_K_M.gguf`）を **C 言
 | §数値検証・回帰テスト | llama.cpp 突合手順 |
 | §トークナイザー / Thinking | チャット template・状態機械・**`--think` 有無による難易度差** |
 | §フルスクラッチ実装アンチパターン | 12 項目 checklist |
+| §ライセンス / 敬意 | Apache 2.0、llama.cpp / Google（Gemma 4）への参照 |
 | `ChangeLog.md` | バグ調査経緯（RoPE 事例） |
 
 ---
@@ -97,7 +98,7 @@ tmp/*
 
 - **ファイル名**: `gemma-4-E4B-it-Q4_K_M.gguf`
 - **量子化**: Q4_K_M（線形層は Q4_K / Q5_K / Q6_K、PLE 投影は BF16、norm 等は F32 が混在）
-- **配布元**: [unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF)（URL は `gguf.txt` に記載）
+- **配布元**: [unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF)（URL は `gguf.txt` に記載）。ベースモデル [Gemma 4](https://ai.google.dev/gemma/docs/core?hl=en) は Google が **Apache License 2.0** で公開
 - **チェックサム**: `gemma-4-E4B-it-Q4_K_M.gguf.sha256sum` に Q4_K_M（推論デフォルト）ほか、同一配布の別量子化（例: Q8_0）の行を併記可能
 
 ### 取得手順
@@ -129,7 +130,7 @@ make model
 |------|------|
 | ソース | `gemma4-4b/cpu-blas/main.c` |
 | ビルド | `make build` → 実行ファイル `gemma4-cpu-blas` |
-| 実行 | `make run` または `./gemma4-cpu-blas <model.gguf> [options]` |
+| 実行 | `make run`（Thinking モードのデモ実行）または `./gemma4-cpu-blas <model.gguf> [options]` |
 | 依存 | C11、`libopenblas`、`libgomp`（OpenMP） |
 | 並列 | OpenMP（`OMP_NUM_THREADS`）。OpenBLAS は `openblas_set_num_threads(1)` で単スレッド固定し、二重並列を避ける |
 
@@ -199,7 +200,7 @@ Thinking 品質調査向けのオプション。通常利用では不要。
 | `llama_dump_layer_hidden.cpp` | llama eval-callback 層出力ダンプ | `-m model.gguf --tokens ids.txt --force gen.txt --dump-at-pos 44` |
 | `compare_vec_dot.cpp` | 1 行分 Q4_K×Q8_K 内積を ggml と比較 | `compare_vec_dot row.bin` |
 
-比較用 llama.cpp は `tmp/llama.cpp/` に配置する想定（Git 管理外）。
+比較用 llama.cpp は `tmp/llama.cpp/` に配置する想定（Git 管理外）。公式リポジトリ: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)。
 
 ### サンプリング
 
@@ -236,7 +237,10 @@ make model          # 初回のみ GGUF 取得
 cd cpu-blas
 make openblas       # 初回: libopenblas-dev, libgomp1（apt、要 sudo の場合あり）
 make build
-make run            # 既定 MODEL=../gemma-4-E4B-it-Q4_K_M.gguf
+make run            # 既定: PROMPT=あなたは何者?, -n 8192 -t 0.7 -k 0.95 --think --show-thinking --thinking-budget 128
+
+# make run のオプションを上書きする例
+make run PROMPT="Explain recursion"   # プロンプトのみ変更（Thinking フラグは Makefile 既定のまま）
 
 # ヘッダが非標準パスにある場合（Debian/Ubuntu pthread ビルド例）
 make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
@@ -268,11 +272,22 @@ OMP_NUM_THREADS=8 ./gemma4-cpu-blas ../gemma-4-E4B-it-Q4_K_M.gguf -p "Hello" -n 
 | 変数 | デフォルト | 説明 |
 |------|------------|------|
 | `MODEL` | `../gemma-4-E4B-it-Q4_K_M.gguf` | 推論対象 GGUF |
-| `PROMPT` | `Hello, how are you?` | `make run` 時のプロンプト |
+| `PROMPT` | `あなたは何者?` | `make run` 時のプロンプト |
 | `CC` | `cc` | C コンパイラ |
 | `CFLAGS` | `-O3 -std=c11 -fopenmp -march=native ...` | OpenMP 有効（`-ffast-math` なし） |
 | `LDFLAGS` | `-fopenmp -lopenblas -lm` | `pkg-config openblas` があれば自動で上書き |
 | `CPPFLAGS` | （空） | `cblas.h` の include パス追加用 |
+
+`make run` は `build` の後、次の固定オプションでバイナリを起動する（`PROMPT` / `MODEL` は Makefile 変数で上書き可能）:
+
+| オプション | 値 | 意図 |
+|------------|-----|------|
+| `-n` | `8192` | 長い thinking + answer を 1 回で確認 |
+| `-t` / `-k` | `0.7` / `0.95` | llama.cpp 既定に近いサンプリング |
+| `--think` / `--show-thinking` | 有効 | Thinking トレースと回答を stderr/stdout で表示 |
+| `--thinking-budget` | `128` | デモ用に thinking 上限を短めに設定 |
+
+CLI 直接起動時の `-p` 既定値（`Hello, how are you?`）とは独立する。通常の単発推論は `./gemma4-cpu-blas ... -p "..."` を使う。
 
 ## アーキテクチャ（Gemma 4 E4B）
 
@@ -1327,4 +1342,18 @@ thinking_tokens: saw_thought && !saw_answer 中の生成 token をカウント
 
 ## ライセンス
 
-本リポジトリのソースおよびドキュメントは Apache License 2.0（`LICENSE`）に従います。GGUF モデル本体の利用条件は配布元（Hugging Face / Google）のライセンスに従います。
+本リポジトリのソースおよびドキュメントは Apache License 2.0（`LICENSE`）に従います。
+
+GGUF モデル本体の利用条件は配布元（[unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF)）およびベースモデル [Gemma 4](https://ai.google.dev/gemma/docs/core?hl=en)（Google）のライセンスに従います。Gemma 4 は **Apache License 2.0** で配布されます。
+
+---
+
+## llama.cpp への敬意
+
+[llama.cpp](https://github.com/ggml-org/llama.cpp) と本実装の間に、ライブラリのリンクなどを含む**依存関係は一切ありません**。一方で、GGUF の扱い方や Gemma 4 の推論手順、数値検証の参照として、llama.cpp の処理内容を参考にしています。
+
+---
+
+## Google（Gemma 4）への敬意
+
+[Gemma 4](https://ai.google.dev/gemma/docs/core?hl=en) を開発・公開してくださった Google に敬意を表します。特に、Gemma 4 が **Apache License 2.0** で配布されるようになったことは、これまでの世代とは大きく異なり、研究・実装・改変の自由度が広がった点で非常にありがたいものです。
