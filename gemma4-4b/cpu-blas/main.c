@@ -1725,17 +1725,20 @@ static void emb_lookup(float *o, const void *w, int type, int id, int dim) {
 static void apply_rope_neox(float *vec, int n_heads, int head_dim, int n_rot, int pos,
                             float freq_base, float freq_scale, const float *freq_factors) {
     float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    int half = head_dim / 2;
     for (int h = 0; h < n_heads; h++) {
+        float *seg = vec + h * head_dim;
         float theta = (float)pos;
-        for (int i = 0; i < n_rot; i += 2) {
-            float ff = freq_factors ? freq_factors[i / 2] : 1.0f;
+        for (int i0 = 0; i0 < n_rot; i0 += 2) {
+            int j = i0 / 2;
+            float ff = freq_factors ? freq_factors[j] : 1.0f;
             float angle = freq_scale * theta / ff;
             float cr = cosf(angle);
             float ci = sinf(angle);
-            int idx = h * head_dim + i;
-            float v0 = vec[idx], v1 = vec[idx + 1];
-            vec[idx]     = v0 * cr - v1 * ci;
-            vec[idx + 1] = v0 * ci + v1 * cr;
+            float v0 = seg[j];
+            float v1 = seg[j + half];
+            seg[j]       = v0 * cr - v1 * ci;
+            seg[j + half] = v0 * ci + v1 * cr;
             theta *= theta_scale;
         }
     }
@@ -1823,6 +1826,15 @@ static void hidden_stats(const float *v, int n, float *out_sum, float *out_l2, f
     *out_max = amax;
 }
 
+static void dump_kv_fingerprint(const float *v, int n, int layer, int pos, const char *tag) {
+    float sum, l2, amax;
+    hidden_stats(v, n, &sum, &l2, &amax);
+    fprintf(stderr, "[kv L%d P%d] %s sum=%.4f l2=%.4f max=%.4f", layer, pos, tag, sum, l2, amax);
+    int show = n < 4 ? n : 4;
+    for (int i = 0; i < show; i++) fprintf(stderr, " v%d=%.6f", i, v[i]);
+    fputc('\n', stderr);
+}
+
 static void forward(Model *m, int token, int pos, int lm_mode) {
     Config *c = &m->cfg;
     Weights *w = &m->w;
@@ -1865,6 +1877,9 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
 
         rmsnorm(s->xb2, s->x, w->attn_norm[l], dim, c->norm_eps);
 
+        if (g_dump_hidden_at == pos && l == 0)
+            dump_kv_fingerprint(s->xb2, dim, l, pos, "attn_norm");
+
         int q8_att = is_q8_mm_type(w->wq_t[l]);
         if (q8_att) quantize_row_q8_K(s->xb2, s->q8, dim);
         mm(s->q, s->xb2, w->wq[l], dim, q_dim, w->wq_t[l], s->q8, q8_att);
@@ -1875,14 +1890,20 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
         if (layer_has_kv(l)) {
             mm(s->k, s->xb2, w->wk[l], dim, kv_dim, w->wk_t[l], s->q8, q8_att);
             mm(s->v, s->xb2, w->wv[l], dim, kv_dim, w->wv_t[l], s->q8, q8_att);
+            if (g_dump_hidden_at == pos && l == 0)
+                dump_kv_fingerprint(s->k, kv_dim, l, pos, "K_pre_norm");
             rmsnorm_head_inplace(s->k, w->k_norm[l], n_kv, hd, c->norm_eps);
             rmsnorm_head_noweight_inplace(s->v, n_kv, hd, c->norm_eps);
+            if (g_dump_hidden_at == pos && l == 0)
+                dump_kv_fingerprint(s->k, kv_dim, l, pos, "K_pre_rope");
             apply_rope_neox(s->k, n_kv, hd, n_rot, pos, rope_base, 1.0f, freq_factors);
 
             float *kc_pos = kc_at(s, l, pos, max_seq);
             float *vc_pos = vc_at(s, l, pos, max_seq);
             memcpy(kc_pos, s->k, (size_t)kv_dim * sizeof(float));
             memcpy(vc_pos, s->v, (size_t)kv_dim * sizeof(float));
+            if (g_dump_hidden_at == pos && l == 0)
+                dump_kv_fingerprint(s->k, kv_dim, l, pos, "K_store");
         }
 
         int kv_src_hd = layer_head_dim(c, kv_src);
@@ -1892,6 +1913,13 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
             if (t_start < 0) t_start = 0;
         }
         int nwin = pos + 1 - t_start;
+
+        if (g_dump_hidden_at == pos && l == 0) {
+            int kv_dim0 = layer_kv_dim(c, 0);
+            dump_kv_fingerprint(kc_at(s, 0, 0, max_seq), kv_dim0, 0, 0, "K_read0");
+            if (pos > 0)
+                dump_kv_fingerprint(kc_at(s, 0, pos, max_seq), kv_dim0, 0, pos, "K_readN");
+        }
 
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < n_heads; h++) {
@@ -1921,10 +1949,24 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
             }
         }
 
+        if (g_dump_hidden_at == pos && l == 0) {
+            float sum, l2, amax;
+            hidden_stats(s->q_out, q_dim, &sum, &l2, &amax);
+            fprintf(stderr, "[hidden pos %d] layer %2d q_out sum=%.4f l2=%.4f max=%.4f\n",
+                    pos, l, sum, l2, amax);
+        }
+
         mm(s->xb2, s->q_out, w->wo[l], q_dim, dim, w->wo_t[l], s->q8, 0);
         rmsnorm(s->xb2, s->xb2, w->post_attn_norm[l], dim, c->norm_eps);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] = x_before[i] + s->xb2[i];
+
+        if (g_dump_hidden_at == pos) {
+            float sum, l2, amax;
+            hidden_stats(s->x, dim, &sum, &l2, &amax);
+            fprintf(stderr, "[hidden pos %d] layer %2d attn_out sum=%.4f l2=%.4f max=%.4f\n",
+                    pos, l, sum, l2, amax);
+        }
 
         memcpy(x_before, s->x, (size_t)dim * sizeof(float));
 
